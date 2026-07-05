@@ -64,17 +64,28 @@ clean:
 	rm -rf build Casquinha.app
 
 # ---- ppc (Mac OS 9 app via Retro68) -----------------------------------------
-# Retro68 provides a PowerPC/CFM GCC + the Rez resource compiler + Universal
-# Interfaces. Point RETRO68 at your build (e.g. ~/Retro68-build/toolchain).
-# The app sources (cq_app.c / cq_ui.c / main.c / cq.r) land from Fio 3 on; until
-# then this target just explains itself rather than pretending to build.
-RETRO68 ?=
+# Cross-builds the classic-PowerPC/CFM app (os9/) with the Retro68 toolchain:
+# GCC + Rez + MakePEF + MacBinary packaging, driven by CMake's add_application.
+# Point RETRO68 at your toolchain (default: ~/Retro68-build/toolchain).
+RETRO68 ?= $(HOME)/Retro68-build/toolchain
+PPC_TOOLCHAIN = $(RETRO68)/powerpc-apple-macos/cmake/retroppc.toolchain.cmake
+# Drop the app on the netatalk AFP share for the OS 9 VM to pick up (override
+# with SHARE=... ; leave empty to skip the copy).
+SHARE ?= $(HOME)/OrbStack/docker/containers/netatalk/share
 
 app:
-	@if [ -z "$(RETRO68)" ]; then \
-	  echo "Set RETRO68=<path-to-toolchain> (Retro68 PowerPC build) to cross-build the OS 9 app."; \
-	  echo "The pure core is verifiable now with 'make test' — no Retro68 needed."; \
+	@if [ ! -f "$(PPC_TOOLCHAIN)" ]; then \
+	  echo "Retro68 not found at $(RETRO68)."; \
+	  echo "Build it (--no-68k --no-carbon) or set RETRO68=<path-to-toolchain>."; \
+	  echo "The pure core + transport are verifiable now with 'make test' — no Retro68 needed."; \
 	  exit 1; \
 	fi
-	@echo "app target wired up in Fio 3 (event loop + now-playing window)."
-	@exit 1
+	@mkdir -p os9/build
+	cd os9/build && PATH="$(RETRO68)/bin:$$PATH" cmake .. \
+	    -DCMAKE_TOOLCHAIN_FILE=$(PPC_TOOLCHAIN) -DCMAKE_BUILD_TYPE=Release >/dev/null
+	cd os9/build && PATH="$(RETRO68)/bin:$$PATH" $(MAKE)
+	@echo "built: os9/build/Casquinha.bin (MacBinary PPC app), .dsk (disk image)"
+	@if [ -n "$(SHARE)" ] && [ -d "$(SHARE)" ]; then \
+	  cp os9/build/Casquinha.bin os9/build/Casquinha.dsk "$(SHARE)/" 2>/dev/null || true; \
+	  echo "dropped Casquinha.bin + .dsk on $(SHARE)"; \
+	fi

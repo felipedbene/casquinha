@@ -56,21 +56,36 @@ New, OS-9-specific (the §4 escape hatches for this era — the R7 analog):
   (97 checks), fixtures wired via `CQ_FIXTURES`. Done — no Retro68/emulator
   needed, exactly as intended.
 
-## In progress
+## Toolchain
 
-- **Fio 2 — Transport.** `cq_transport.h` is a poll-driven state-machine seam.
-  - **POSIX impl** (`cq_transport_posix.c`) — done and verified on the host: a
-    localhost loopback unit test (`make test`, 106 checks) *and* a live probe
-    against the real server (`make probe` → parsed `/now` from 10.0.100.112:70).
-  - **Open Transport impl** (`cq_transport_ot.c`) — written; a synchronous +
-    non-blocking endpoint advanced from the event loop, TickCount deadlines.
-    Being **compiled locally with Retro68** (installing now) so the PowerPC/CFM
-    build is checked here, not just on the VM. **UTM is the victory lap** — the
-    final on-hardware run, not where compile errors get found.
+Retro68 is built locally (`~/Retro68-build/toolchain`, PowerPC/CFM only:
+`--no-68k --no-carbon`). `make app` cross-builds the OS 9 app and drops
+`Casquinha.bin`/`.dsk` on the netatalk AFP share for the VM. **UTM is the victory
+lap** — the final on-hardware run, not where compile errors get found.
 
-## Next
+**Interfaces caveat (load-bearing):** Retro68 ships the open-source **Multiversal
+Interfaces**, which have the full Toolbox (Window/Menu/Dialog/QuickDraw/Events/
+Fonts…) but **NOT Open Transport, MacTCP, or Carbon**. So the Toolbox UI builds
+today; the live network wire does not. Getting OT needs Apple's Universal
+Interfaces (from the MPW Golden Master) folded in with `--universal`, or a
+hand-rolled minimal OT header + CFM import stub. Deferred — see Fio 3.
 
-- Finish Fio 2: get `cq_transport_ot.c` compiling under Retro68, wire `make app`.
-- Then Fio 3 (now-playing window), 4 (transport controls), 5 (cover), 6 (prefs +
-  cache), 7 (search + queue). Gopher browser and audio come later.
-- Ship builds to the OS 9 VM via the netatalk AFP share (see memory).
+## Done
+
+- **Fio 3 (first slice) — the app runs.** `os9/casquinha.c` is a classic-PPC
+  Toolbox app: a document window, an Apple/File▸Quit menu bar, a `WaitNextEvent`
+  loop, rendering a now-playing snapshot **through the real pure core**
+  (`cq_codec`→`cq_now`) in Monaco. `make app` → `Casquinha.bin` (MacBinary PPC
+  app) + `.dsk`, verified to build clean and dropped on the share for UTM.
+  Snapshot is a baked `/now` fixture for now (no OT yet — see caveat above).
+
+## In progress / Next
+
+- **Fio 2 tail — the OT wire.** `cq_transport_posix.c` is verified on the host
+  (`make test` 106 checks + `make probe` against the live server).
+  `cq_transport_ot.c` is written but **cannot compile without OT headers**
+  (Multiversal gap above). Next: fold in Apple's Universal Interfaces (or a
+  minimal OT import stub), then swap the baked fixture in `casquinha.c` for a
+  2 s poll → `cq_guard` → render, with TEC UTF-8→MacRoman at the draw boundary.
+- Then Fio 4 (transport controls), 5 (cover), 6 (prefs + cache), 7 (search +
+  queue). Gopher browser and audio come later.

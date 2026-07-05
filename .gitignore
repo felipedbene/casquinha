@@ -1,4 +1,5 @@
 build/
+os9/build/
 Casquinha.app/
 *.o
 *.dSYM/
