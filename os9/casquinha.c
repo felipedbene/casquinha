@@ -34,6 +34,7 @@
 #include <Components.h>
 #include <Folders.h>
 #include <Files.h>
+#include <Lists.h>
 
 #include <string.h>
 #include <stdio.h>
@@ -44,6 +45,7 @@
 #include "cq_guard.h"
 #include "cq_backoff.h"
 #include "cq_debounce.h"
+#include "cq_track.h"
 #include "cq_transport.h"
 
 enum {
@@ -54,8 +56,10 @@ enum {
     kMainWindow  = 128,
     kPrefsDialog = 129,
     kAboutItem   = 1,
-    kPrefsItem   = 1,    /* File menu */
-    kQuitItem    = 3     /* File menu: Preferences, -, Quit */
+    kSearchItem  = 1,    /* File menu */
+    kQueueItem   = 2,
+    kPrefsItem   = 4,    /* File menu: Search, Queue, -, Preferences, -, Quit */
+    kQuitItem    = 6
 };
 
 #define CQ_DEFAULT_HOST "10.0.100.112"  /* server address is a pref (Fio 6) */
@@ -109,6 +113,18 @@ static cq_transport *gCover   = NULL;    /* in-flight cover fetch */
 static GWorldPtr     gCoverGW = NULL;    /* decoded 64x64 cover */
 static char          gCoverAlbum[64] = "";  /* album_id currently decoded (or tried) */
 static char          gCoverReq[64]   = "";  /* album_id being fetched */
+
+/* --- search + queue windows (Fio 7) --- */
+static WindowRef     gSearchWin = NULL;
+static ListHandle    gSearchList = NULL;
+static ControlHandle gSearchEdit = NULL;
+static cq_transport *gSearchTx = NULL;
+static cq_track_list gSearchItems;
+static WindowRef     gQueueWin = NULL;
+static ListHandle    gQueueList = NULL;
+static cq_transport *gQueueTx = NULL;
+static cq_track_list gQueueItems;
+static ControlHandle gSearchBtn = NULL;
 
 /* -------------------------------------------------------------------------- */
 
@@ -530,6 +546,194 @@ static void DoContentClick(WindowRef win, Point where)
     }
 }
 
+/* --- search + queue windows (Fio 7) --- */
+
+/* Percent-escape into out. keepColon leaves ':' raw (Spotify URIs want it). */
+static void EscInto(const char *s, char *out, size_t max, int keepColon)
+{
+    static const char *hx = "0123456789ABCDEF";
+    size_t o = 0;
+    for (; *s && o + 3 < max; s++) {
+        unsigned char c = (unsigned char)*s;
+        int safe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                   (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~';
+        if (keepColon && c == ':') safe = 1;
+        if (safe) out[o++] = (char)c;
+        else { out[o++] = '%'; out[o++] = hx[c >> 4]; out[o++] = hx[c & 15]; }
+    }
+    out[o] = '\0';
+}
+
+/* Replace a list's rows with "track - artist" for each item. */
+static void FillList(ListHandle list, cq_track_list *items)
+{
+    size_t i;
+    Cell cell;
+    if (!list) return;
+    LDelRow(0, 0, list);
+    for (i = 0; i < items->count; i++) {
+        char row[256], mac[260];
+        short len;
+        snprintf(row, sizeof(row), "%s - %s",
+                 items->items[i].track  ? items->items[i].track  : "?",
+                 items->items[i].artist ? items->items[i].artist : "");
+        len = ToMacRoman(row, mac, sizeof(mac));
+        LAddRow(1, (short)i, list);
+        SetPt(&cell, 0, (short)i);
+        LSetCell(mac, len, cell, list);
+    }
+    InvalRect(&(*list)->rView);
+}
+
+static ListHandle MakeList(WindowRef win, short top)
+{
+    Rect view, bounds;
+    Point csize;
+    short W = ((GrafPtr)win)->portRect.right - ((GrafPtr)win)->portRect.left;
+    short H = ((GrafPtr)win)->portRect.bottom - ((GrafPtr)win)->portRect.top;
+    ListHandle l;
+    SetRect(&view, 8, top, W - 8 - 15, H - 8);   /* room for the vertical scrollbar */
+    SetRect(&bounds, 0, 0, 0, 1);
+    SetPt(&csize, 0, 0);
+    l = LNew(&view, &bounds, csize, 0, win, true, false, false, true);
+    return l;
+}
+
+/* Fire a selector and discard the reply (for /spot/play + queue/add, which
+ * return a gophermap or /queue, NOT a /now — must not go through AdoptReply). */
+static cq_transport *gFire = NULL;
+static void StartFire(const char *sel)
+{
+    if (gFire) return;
+    gFire = cq_tx_new(gHost, gPort, sel);
+    if (gFire) cq_tx_start(gFire);
+}
+
+static void PlayItem(cq_track_list *items, int row)
+{
+    char euri[128], sel[160];
+    if (row < 0 || (size_t)row >= items->count || !items->items[row].uri) return;
+    EscInto(items->items[row].uri, euri, sizeof(euri), 1);   /* keep the colons */
+    snprintf(sel, sizeof(sel), "/spot/play?uri=%s", euri);
+    StartFire(sel);
+}
+
+static void OpenQueue(void)
+{
+    Rect r;
+    if (gQueueWin) { SelectWindow(gQueueWin); }
+    else {
+        SetRect(&r, 96, 96, 96 + 320, 96 + 260);
+        gQueueWin = NewCWindow(NULL, &r, "\pQueue", true, documentProc, (WindowPtr)-1, true, 0);
+        SetPort((GrafPtr)gQueueWin);
+        gQueueList = MakeList(gQueueWin, 8);
+    }
+    if (!gQueueTx) {
+        gQueueTx = cq_tx_new(gHost, gPort, "/spot/api/1/queue");
+        if (gQueueTx) cq_tx_start(gQueueTx);
+    }
+}
+
+static void RunSearch(void)
+{
+    char q[128], eq[400], sel[440];
+    Size got = 0;
+    if (!gSearchEdit) return;
+    GetControlData(gSearchEdit, kControlNoPart, kControlEditTextTextTag,
+                   sizeof(q) - 1, (Ptr)q, &got);
+    if (got < 0) got = 0;
+    q[got] = '\0';
+    if (!q[0]) return;
+    EscInto(q, eq, sizeof(eq), 0);
+    snprintf(sel, sizeof(sel), "/spot/api/1/search?q=%s", eq);
+    if (gSearchTx) { cq_tx_cancel(gSearchTx); cq_tx_free(gSearchTx); }
+    gSearchTx = cq_tx_new(gHost, gPort, sel);
+    if (gSearchTx) cq_tx_start(gSearchTx);
+}
+
+static void OpenSearch(void)
+{
+    Rect r, er, br;
+    if (gSearchWin) { SelectWindow(gSearchWin); return; }
+    SetRect(&r, 116, 116, 116 + 340, 116 + 280);
+    gSearchWin = NewCWindow(NULL, &r, "\pSearch", true, documentProc, (WindowPtr)-1, true, 0);
+    SetPort((GrafPtr)gSearchWin);
+    SetRect(&er, 8, 8, 340 - 8 - 70, 26);
+    gSearchEdit = NewControl(gSearchWin, &er, "\p", true, 0, 0, 0, kControlEditTextProc, 0);
+    SetRect(&br, 340 - 8 - 64, 6, 340 - 8, 26);
+    gSearchBtn = NewControl(gSearchWin, &br, "\pSearch", true, 0, 0, 0, pushButProc, 0);
+    gSearchList = MakeList(gSearchWin, 36);
+}
+
+/* Close one of the auxiliary windows, freeing its list + items. */
+static void CloseAux(WindowRef win)
+{
+    if (win == gQueueWin) {
+        if (gQueueList) LDispose(gQueueList);
+        cq_track_list_free(&gQueueItems);
+        if (gQueueTx) { cq_tx_cancel(gQueueTx); cq_tx_free(gQueueTx); gQueueTx = NULL; }
+        DisposeWindow(win);
+        gQueueWin = NULL; gQueueList = NULL;
+    } else if (win == gSearchWin) {
+        if (gSearchList) LDispose(gSearchList);
+        cq_track_list_free(&gSearchItems);
+        if (gSearchTx) { cq_tx_cancel(gSearchTx); cq_tx_free(gSearchTx); gSearchTx = NULL; }
+        DisposeWindow(win);
+        gSearchWin = NULL; gSearchList = NULL; gSearchEdit = NULL; gSearchBtn = NULL;
+    }
+}
+
+/* Click inside a list window: a control (search field/button) or the list. */
+static void AuxClick(WindowRef win, Point where)
+{
+    ControlHandle ctl;
+    ListHandle list = (win == gQueueWin) ? gQueueList : gSearchList;
+    cq_track_list *items = (win == gQueueWin) ? &gQueueItems : &gSearchItems;
+
+    SetPort((GrafPtr)win);
+    GlobalToLocal(&where);
+
+    if (win == gSearchWin && FindControl(where, win, &ctl) && ctl) {
+        if (ctl == gSearchBtn) { if (TrackControl(ctl, where, NULL)) RunSearch(); }
+        else if (ctl == gSearchEdit) { HandleControlClick(ctl, where, 0, NULL); }
+        return;
+    }
+    if (list && LClick(where, 0, list)) {     /* double-click a row -> play it */
+        Cell c;
+        SetPt(&c, 0, 0);
+        if (LGetSelect(true, &c, list)) PlayItem(items, c.v);
+    }
+}
+
+/* Advance the search/queue/fire transactions; parse a list reply and fill it. */
+static void PumpAux(void)
+{
+    if (gFire && cq_tx_poll(gFire) != CQ_TX_RUNNING) { cq_tx_free(gFire); gFire = NULL; }
+
+    if (gSearchTx) {
+        cq_tx_status st = cq_tx_poll(gSearchTx);
+        if (st == CQ_TX_DONE) {
+            size_t len = 0;
+            const unsigned char *d = cq_tx_data(gSearchTx, &len);
+            cq_track_list_free(&gSearchItems);
+            cq_track_list_from_response(&gSearchItems, d, len);
+            FillList(gSearchList, &gSearchItems);
+            cq_tx_free(gSearchTx); gSearchTx = NULL;
+        } else if (st == CQ_TX_FAILED) { cq_tx_free(gSearchTx); gSearchTx = NULL; }
+    }
+    if (gQueueTx) {
+        cq_tx_status st = cq_tx_poll(gQueueTx);
+        if (st == CQ_TX_DONE) {
+            size_t len = 0;
+            const unsigned char *d = cq_tx_data(gQueueTx, &len);
+            cq_track_list_free(&gQueueItems);
+            cq_track_list_from_response(&gQueueItems, d, len);
+            FillList(gQueueList, &gQueueItems);
+            cq_tx_free(gQueueTx); gQueueTx = NULL;
+        } else if (st == CQ_TX_FAILED) { cq_tx_free(gQueueTx); gQueueTx = NULL; }
+    }
+}
+
 /* --- preferences: the server address (Fio 6) --- */
 
 static void C2P(const char *c, Str255 p)
@@ -661,7 +865,9 @@ static void DoMenu(long choice)
             }
             break;
         case kFileMenu:
-            if (item == kPrefsItem)      DoPrefs();
+            if (item == kSearchItem)     OpenSearch();
+            else if (item == kQueueItem) OpenQueue();
+            else if (item == kPrefsItem) DoPrefs();
             else if (item == kQuitItem)  gRunning = false;
             break;
     }
@@ -677,10 +883,16 @@ static void DoMouseDown(EventRecord *ev)
         case inMenuBar:   DoMenu(MenuSelect(ev->where));            break;
         case inSysWindow: SystemClick(ev, win);                    break;
         case inDrag:      DragWindow(win, ev->where, NULL);        break;
-        case inGoAway:    if (TrackGoAway(win, ev->where)) gRunning = false; break;
+        case inGoAway:
+            if (TrackGoAway(win, ev->where)) {
+                if (win == gWindow) gRunning = false;
+                else CloseAux(win);
+            }
+            break;
         case inContent:
             if (win != FrontWindow()) SelectWindow(win);
-            else DoContentClick(win, ev->where);
+            else if (win == gWindow)  DoContentClick(win, ev->where);
+            else                      AuxClick(win, ev->where);
             break;
     }
 }
@@ -741,14 +953,31 @@ int main(void)
                     DoMouseDown(&ev);
                     break;
                 case keyDown:
-                case autoKey:
-                    if (ev.modifiers & cmdKey)
-                        DoMenu(MenuKey((char)(ev.message & charCodeMask)));
+                case autoKey: {
+                    char ch = (char)(ev.message & charCodeMask);
+                    if (ev.modifiers & cmdKey) {
+                        DoMenu(MenuKey(ch));
+                    } else if (FrontWindow() == gSearchWin && gSearchEdit) {
+                        if (ch == '\r' || ch == '\n') RunSearch();
+                        else HandleControlKey(gSearchEdit,
+                                 (short)((ev.message & keyCodeMask) >> 8), ch, ev.modifiers);
+                    }
                     break;
+                }
                 case updateEvt: {
                     WindowRef win = (WindowRef)ev.message;
                     BeginUpdate(win);
-                    DrawWindowContents(win);
+                    if (win == gWindow) {
+                        DrawWindowContents(win);
+                    } else {
+                        ListHandle list = (win == gQueueWin) ? gQueueList :
+                                          (win == gSearchWin) ? gSearchList : NULL;
+                        SetPort((GrafPtr)win);
+                        SetThemeWindowBackground(win, kThemeBrushDialogBackgroundActive, false);
+                        EraseRect(&((GrafPtr)win)->portRect);
+                        UpdateControls(win, ((GrafPtr)win)->visRgn);
+                        if (list) { LUpdate(((GrafPtr)win)->visRgn, list); FrameRect(&(*list)->rView); }
+                    }
                     EndUpdate(win);
                     break;
                 }
@@ -757,6 +986,8 @@ int main(void)
             }
         }
         PollNetwork();
+        PumpAux();
+        if (gSearchWin) IdleControls(gSearchWin);   /* blink the search caret */
 
         {   /* animate the diagnostics ~2x/sec so it's visible the loop is alive */
             unsigned long now = (unsigned long)TickCount();
