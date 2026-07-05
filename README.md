@@ -18,17 +18,25 @@ just plain C, **Open Transport**, and the **Toolbox** on a cooperative event loo
 
 ## Status
 
-- **Fio 0 — scaffold.** Repo, dual-family Makefile, fixtures, docs.
-- **Fio 1 — pure core + tests.** The Codec / Model / Reconciler layers as plain
-  C99 (`src/cq_*.c`), with an offline test suite that runs **on your modern Mac**
-  — no Retro68, no emulator (`make test`, 97 checks green). This is the
-  offline-forever proof of the pure stack that the pattern promises.
+A full native Mac OS 9 client. The pure core (Codec / Model / Reconciler) is
+plain C99 with an offline suite that runs **on a modern Mac** — no Retro68, no
+emulator (`make test`, 117 checks green). The app is classic PowerPC + Open
+Transport + the Toolbox, cross-built with Retro68.
 
-Everything below Fio 1 (the Open Transport wire, the Toolbox now-playing window,
-transport controls, cover art, prefs) is the Mac OS 9 rewrite surface, landing
-one numbered *fio* at a time. See [`NOTES.md`](NOTES.md) for the roadmap and the
-permanent constraints, and [`design/PATTERN-MAP-os9.md`](design/PATTERN-MAP-os9.md)
-for the full DeGelato → Mac OS 9.2 mapping.
+- **Fios 0–3** — scaffold, pure core, transport seam, and the **Platinum
+  now-playing window** polling live over Open Transport (2 s → `cq_guard` →
+  render; TEC UTF-8→MacRoman; graceful 429 backoff). *Validated on the VM.*
+- **Fio 4** — transport controls (prev/play-pause/next, volume, seek).
+- **Fio 5** — album cover art (QuickTime GraphicsImporter).
+- **Fio 6** — preferences (configurable server address, ⌘,).
+- **Fio 7** — search + queue windows (List Manager, ⌘F / ⌘U).
+- **Icon** — the otter, as a classic `ICN#`/`icl8` family.
+- **Audio (⌘T)** — live Icecast MP3 via QuickTime (best-effort; the one piece
+  still to be verified on the VM).
+
+See [`NOTES.md`](NOTES.md) for the full arc + permanent constraints, and
+[`design/PATTERN-MAP-os9.md`](design/PATTERN-MAP-os9.md) for the DeGelato →
+Mac OS 9.2 mapping.
 
 ## Building
 

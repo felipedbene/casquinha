@@ -73,25 +73,41 @@ OpenTransportLib` — the App lib gives `InitOpenTransport`, InetPPC gives
 `OTOpenInternetServices`, InternetLib gives `OTInetStringToAddress` /
 `OTInitInetAddress`.
 
-## Done
+## Done — the full arc (all fios)
 
-- **Fio 3 — the app polls live over Open Transport.** `os9/casquinha.c` is a
-  classic-PPC Toolbox app (document window, Apple/File▸Quit menu, `WaitNextEvent`
-  loop). The loop drives `cq_transport_ot`: every 2 s (a `TickCount` delta) it
-  starts a `/spot/api/1/now` transaction, advances it non-blocking each pass,
-  adopts the reply through `cq_guard` (law 2), and renders the snapshot in
-  Monaco; `offline - retrying` on failure, keeping the last snapshot. `make app`
-  → `Casquinha.bin` (MacBinary PPC, ~85 KB) + `.dsk`, builds warning-free and is
-  on the share. `cq_transport_ot.c` is **compile + link verified** against Apple's
-  real OT headers/libs; runtime is the UTM victory lap.
+Validated on the VM through Fio 3; Fios 4–7 + audio are **compile+link verified**
+with Retro68 and on the share, pending the UTM runtime pass.
 
-## Next
+- **Fio 3 — live now-playing over Open Transport**, VALIDATED on the VM. Platinum
+  window (Appearance Manager, classic PPC — no Carbon): themed background, green
+  accent, bold track title (green when playing), Geneva metadata, native
+  `DrawThemeTrack` progress bar interpolated between polls. 2 s `TickCount` poll →
+  `cq_guard` → render. **TEC UTF-8→MacRoman** at the draw boundary (accents).
+  **Graceful 429**: check the `error` key first (never blank a good snapshot),
+  `cq_backoff` (pure, tested) eases the poll 2 s→30 s and recovers.
+- **Fio 4 — transport controls.** Themed Prev/Play-Pause/Next buttons + volume
+  slider + click-to-seek on the bar. Prev/Next coalesced with `cq_debounce`
+  (law 1); command reply adopted via the shared guard (law 3); a single hold
+  window on the slider (law 4). Commands ride their own OT transaction (`gCmd`).
+- **Fio 5 — album cover art.** QuickTime `GraphicsImporter` decodes the `/cover`
+  JPEG (`FF D8` sniff, law 7) into a 64×64 GWorld, drawn in the corner.
+- **Fio 6 — preferences.** Server host/port in a `Casquinha Prefs` file
+  (`FindFolder`); File▸Preferences (⌘,) dialog; every transaction targets the
+  configured `gHost/gPort`.
+- **Fio 7 — search + queue.** Non-modal List Manager windows (⌘F / ⌘U) so the
+  poll keeps running; `cq_track` parses the `item.<i>.*` lists; double-click a row
+  to play (`/spot/play?uri=`, fire-and-forget).
+- **Icon.** Classic `ICN#/icl8/ics#/ics8` + `BNDL`/`FREF`/`Casq` signature from
+  the otter art (`tools/gen_icons.py`); app built with `CREATOR 'Casq'`.
+- **Audio (⌘T).** QuickTime URL movie from `/spot/stream.pls` (`cq_pls`). **The
+  one unverified piece** — classic-QT Icecast streaming is finicky; needs VM
+  testing, may need a Sound Manager / movie-import fallback.
 
-- **UTM runtime pass:** launch `Casquinha` in the OS 9 VM, confirm live
-  now-playing from `10.0.100.112:70`, and check §5 ground truth (one gesture →
-  one served command) once controls land.
-- Render polish: TEC UTF-8→MacRoman at the draw boundary (accents), and the
-  1 Hz interpolation tick between polls.
-- Fio 4 (transport controls: prev/play-pause/next/seek/volume + `cq_debounce`),
-  5 (cover via QuickTime), 6 (prefs + cache), 7 (search + queue). Then the classic
-  `ICN#`/`icl8` app icon (Rez the otter in), the gopher browser, and audio.
+## Next (for the human)
+
+- **UTM runtime pass on Fios 4–7 + audio.** Ground truth (§5): one gesture → one
+  served command. Watch the audio path especially.
+- Possible polish: the otter icon may need a desktop-DB rebuild (⌘⌥ at boot);
+  cover disk cache across launches; the gopher browser (a later line).
+- Re-sign the autonomous-run commits if desired (they're unsigned; the 1Password
+  agent was locked — `git config commit.gpgsign true` and rebase-reword, or leave).
