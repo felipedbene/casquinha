@@ -113,7 +113,9 @@ static void DrawWindowContents(WindowRef win)
                  gSnap.device == CQ_DEV_IDLE   ? "device idle"   : "device unknown");
         DrawCStr(16, 136, line);
     } else {
-        DrawCStr(16, 58, "waiting for first snapshot...");
+        /* No snapshot yet: lead with the friendly status (e.g. the rate-limit
+         * message) rather than a blank "waiting". */
+        DrawCStr(16, 58, gLastMsg[0] ? gLastMsg : "connecting...");
     }
 
     /* runtime diagnostics — the UTM debugging pass */
@@ -122,7 +124,8 @@ static void DrawWindowContents(WindowRef win)
              gPolls, gDone, gLastStat, gLastErr, gLastLen,
              (long)(cq_backoff_interval(&gBackoff) / 60));
     DrawCStr(16, 170, line);
-    DrawCStr(16, 184, gLastMsg[0] ? gLastMsg : (gOnline ? "online" : "-"));
+    if (gHaveSnap && gLastMsg[0])   /* a good snapshot on screen + a live error */
+        DrawCStr(16, 184, gLastMsg);
 }
 
 static void Redraw(void)
@@ -153,9 +156,13 @@ static void PollNetwork(void)
             cq_fields_parse(&f, d, len);
             err = cq_fields_get(&f, "error");
             if (err) {
-                const char *msg = cq_fields_get(&f, "message");
-                snprintf(gLastMsg, sizeof(gLastMsg), "server: %s%s%s",
-                         err, msg ? " - " : "", msg ? msg : "");
+                /* Friendly, calm status — an upstream 429 is the bridge being
+                 * Spotify-rate-limited, not a client fault; we ease off and
+                 * recover automatically. */
+                if (strcmp(err, "upstream") == 0)
+                    snprintf(gLastMsg, sizeof(gLastMsg), "Spotify busy (rate limited) - easing off");
+                else
+                    snprintf(gLastMsg, sizeof(gLastMsg), "server error: %s", err);
                 cq_backoff_fail(&gBackoff);                 /* don't hammer a 429 */
             } else {
                 cq_now tmp;
