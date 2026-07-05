@@ -12,9 +12,21 @@ add_application(Casquinha
     ../src/cq_track.c
     ../src/cq_guard.c
     ../src/cq_debounce.c
+    ../src/cq_transport_ot.c      # Open Transport backend (guarded by CQ_OS9)
 )
 
 target_include_directories(Casquinha PRIVATE ../src)
+target_compile_definitions(Casquinha PRIVATE CQ_OS9)
+
+# Open Transport: application-context init (InitOpenTransport) + core endpoint
+# calls + the Internet module (OTOpenInternetServices / OTInetStringToAddress /
+# OTInitInetAddress). Order matters for static resolution (glue before imports).
+target_link_libraries(Casquinha
+    OpenTransportAppPPC
+    OpenTptInetPPC
+    OpenTptInternetLib
+    OpenTransportLib
+)
 
 # Smallest possible app: drop unused functions.
 set_target_properties(Casquinha PROPERTIES COMPILE_OPTIONS -ffunction-sections)

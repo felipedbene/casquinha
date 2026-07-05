@@ -63,29 +63,35 @@ Retro68 is built locally (`~/Retro68-build/toolchain`, PowerPC/CFM only:
 `Casquinha.bin`/`.dsk` on the netatalk AFP share for the VM. **UTM is the victory
 lap** — the final on-hardware run, not where compile errors get found.
 
-**Interfaces caveat (load-bearing):** Retro68 ships the open-source **Multiversal
-Interfaces**, which have the full Toolbox (Window/Menu/Dialog/QuickDraw/Events/
-Fonts…) but **NOT Open Transport, MacTCP, or Carbon**. So the Toolbox UI builds
-today; the live network wire does not. Getting OT needs Apple's Universal
-Interfaces (from the MPW Golden Master) folded in with `--universal`, or a
-hand-rolled minimal OT header + CFM import stub. Deferred — see Fio 3.
+**Interfaces (resolved):** Retro68's open-source Multiversal Interfaces have the
+full Toolbox but **no Open Transport / MacTCP / Carbon**. So Apple's **Universal
+Interfaces** were folded in (`InterfacesAndLibraries/`, from macintoshgarden's
+ready-extracted zip — no MPW `.img` needed) and Retro68 rebuilt
+`--universal --skip-thirdparty`. OT now compiles + links. **Link libs for OT**
+(order matters): `OpenTransportAppPPC OpenTptInetPPC OpenTptInternetLib
+OpenTransportLib` — the App lib gives `InitOpenTransport`, InetPPC gives
+`OTOpenInternetServices`, InternetLib gives `OTInetStringToAddress` /
+`OTInitInetAddress`.
 
 ## Done
 
-- **Fio 3 (first slice) — the app runs.** `os9/casquinha.c` is a classic-PPC
-  Toolbox app: a document window, an Apple/File▸Quit menu bar, a `WaitNextEvent`
-  loop, rendering a now-playing snapshot **through the real pure core**
-  (`cq_codec`→`cq_now`) in Monaco. `make app` → `Casquinha.bin` (MacBinary PPC
-  app) + `.dsk`, verified to build clean and dropped on the share for UTM.
-  Snapshot is a baked `/now` fixture for now (no OT yet — see caveat above).
+- **Fio 3 — the app polls live over Open Transport.** `os9/casquinha.c` is a
+  classic-PPC Toolbox app (document window, Apple/File▸Quit menu, `WaitNextEvent`
+  loop). The loop drives `cq_transport_ot`: every 2 s (a `TickCount` delta) it
+  starts a `/spot/api/1/now` transaction, advances it non-blocking each pass,
+  adopts the reply through `cq_guard` (law 2), and renders the snapshot in
+  Monaco; `offline - retrying` on failure, keeping the last snapshot. `make app`
+  → `Casquinha.bin` (MacBinary PPC, ~85 KB) + `.dsk`, builds warning-free and is
+  on the share. `cq_transport_ot.c` is **compile + link verified** against Apple's
+  real OT headers/libs; runtime is the UTM victory lap.
 
-## In progress / Next
+## Next
 
-- **Fio 2 tail — the OT wire.** `cq_transport_posix.c` is verified on the host
-  (`make test` 106 checks + `make probe` against the live server).
-  `cq_transport_ot.c` is written but **cannot compile without OT headers**
-  (Multiversal gap above). Next: fold in Apple's Universal Interfaces (or a
-  minimal OT import stub), then swap the baked fixture in `casquinha.c` for a
-  2 s poll → `cq_guard` → render, with TEC UTF-8→MacRoman at the draw boundary.
-- Then Fio 4 (transport controls), 5 (cover), 6 (prefs + cache), 7 (search +
-  queue). Gopher browser and audio come later.
+- **UTM runtime pass:** launch `Casquinha` in the OS 9 VM, confirm live
+  now-playing from `10.0.100.112:70`, and check §5 ground truth (one gesture →
+  one served command) once controls land.
+- Render polish: TEC UTF-8→MacRoman at the draw boundary (accents), and the
+  1 Hz interpolation tick between polls.
+- Fio 4 (transport controls: prev/play-pause/next/seek/volume + `cq_debounce`),
+  5 (cover via QuickTime), 6 (prefs + cache), 7 (search + queue). Then the classic
+  `ICN#`/`icl8` app icon (Rez the otter in), the gopher browser, and audio.
