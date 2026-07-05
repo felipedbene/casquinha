@@ -1,0 +1,63 @@
+# Casquinha — a gopher-spot Spotify remote for Mac OS 9.2 (PowerPC / Open Transport).
+# Sibling to DeToca (10.6/i386) and DeGelato (10.5/ppc); see fhb/CLIENT-PATTERN.md.
+#
+# Two target families:
+#   * HOST  — the pure core + its offline test suite, built with the system cc.
+#             Needs NO Retro68 and NO emulator: `make test` runs on this Mac.
+#   * PPC   — the Mac OS 9 app (Open Transport + Toolbox), cross-built with
+#             Retro68. Wired up from Fio 3 on; see the `app` target below.
+
+# ---- host (pure core + tests) -----------------------------------------------
+CC      ?= cc
+CFLAGS  ?= -std=c99 -Wall -Wextra -pedantic -O0 -g -Isrc
+
+CORE_SRC = \
+	src/cq_codec.c \
+	src/cq_now.c \
+	src/cq_track.c \
+	src/cq_guard.c \
+	src/cq_debounce.c \
+	src/cq_pls.c
+
+TEST_SRC = \
+	tests/cq_test.c \
+	tests/codec_test.c \
+	tests/now_test.c \
+	tests/track_test.c \
+	tests/guard_test.c \
+	tests/debounce_test.c \
+	tests/pls_test.c \
+	tests/run_tests.c
+
+FIXTURES = $(CURDIR)/tests/Fixtures
+
+.PHONY: all test clean app
+
+all: test
+
+# Build and run the pure-core suite, fully offline, with the fixtures wired in.
+test: build/run_tests
+	CQ_FIXTURES=$(FIXTURES) build/run_tests
+
+build/run_tests: $(CORE_SRC) $(TEST_SRC)
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(CORE_SRC) $(TEST_SRC) -o $@
+
+clean:
+	rm -rf build Casquinha.app
+
+# ---- ppc (Mac OS 9 app via Retro68) -----------------------------------------
+# Retro68 provides a PowerPC/CFM GCC + the Rez resource compiler + Universal
+# Interfaces. Point RETRO68 at your build (e.g. ~/Retro68-build/toolchain).
+# The app sources (cq_app.c / cq_ui.c / main.c / cq.r) land from Fio 3 on; until
+# then this target just explains itself rather than pretending to build.
+RETRO68 ?=
+
+app:
+	@if [ -z "$(RETRO68)" ]; then \
+	  echo "Set RETRO68=<path-to-toolchain> (Retro68 PowerPC build) to cross-build the OS 9 app."; \
+	  echo "The pure core is verifiable now with 'make test' — no Retro68 needed."; \
+	  exit 1; \
+	fi
+	@echo "app target wired up in Fio 3 (event loop + now-playing window)."
+	@exit 1
