@@ -64,6 +64,7 @@ enum {
     kQuitItem    = 7
 };
 
+#define CQ_BUILD_TAG "b7"  /* bump on every VM-iteration build (see status row) */
 #define CQ_DEFAULT_HOST "10.0.100.112"  /* server address is a pref (Fio 6) */
 #define CQ_DEFAULT_PORT 70
 #define CQ_POLL_TICKS 120           /* 2 s at 60 ticks/sec (law 5: >= micro-cache) */
@@ -126,7 +127,14 @@ static WindowRef     gQueueWin = NULL;
 static ListHandle    gQueueList = NULL;
 static cq_transport *gQueueTx = NULL;
 static cq_track_list gQueueItems;
+static unsigned long gQueueLast = 0;        /* last /queue fetch (ticks) */
+#define CQ_QUEUE_POLL_TICKS 300             /* re-fetch every 5 s while the window is open */
+/* Double-click row i in the queue = skip forward i+1 times: the Web API has no
+ * "jump to queue position" (nor reorder/remove — the queue is append-only), so
+ * the jump is expressed as chained /next commands, fired one at a time. */
+static short gSkipsPending = 0;
 static ControlHandle gSearchBtn = NULL;
+static ControlHandle gQueueAddBtn = NULL;   /* "Add to Queue" on the selected search row */
 
 /* -------------------------------------------------------------------------- */
 
@@ -270,11 +278,14 @@ static void DrawWindowContents(WindowRef win)
     /* State / device row (below the transport buttons). */
     TextFont(1); TextSize(10);
     ThemeText(kThemeTextColorDialogActive);
-    snprintf(line, sizeof(line), "%s      %s",
+    /* CQ_BUILD_TAG: bumped per VM-iteration build so it's provable WHICH binary
+     * is running over there (stale copies on the netatalk share bite). */
+    snprintf(line, sizeof(line), "%s      %s      [%s]",
              gSnap.state == CQ_STATE_PLAYING ? "Playing" :
              gSnap.state == CQ_STATE_PAUSED  ? "Paused"  : "Stopped",
              gSnap.device == CQ_DEV_ACTIVE ? "on gopher-spot" :
-             gSnap.device == CQ_DEV_IDLE   ? "playing elsewhere" : "");
+             gSnap.device == CQ_DEV_IDLE   ? "playing elsewhere" : "",
+             CQ_BUILD_TAG);
     DrawCStr(16, 202, line);
 
     /* Album cover (Fio 5), top-right, drawn last so it sits above the text. */
@@ -584,18 +595,29 @@ static void FillList(ListHandle list, cq_track_list *items)
         SetPt(&cell, 0, (short)i);
         LSetCell(mac, len, cell, list);
     }
-    InvalRect(&(*list)->rView);
+    {   /* InvalRect targets the CURRENT port; this runs from PumpAux, where the
+         * port is whatever was drawn last (usually gWindow) — aim it at the
+         * list's own window or the redraw lands in the wrong one. */
+        GrafPtr save;
+        GetPort(&save);
+        SetPort((*list)->port);
+        InvalRect(&(*list)->rView);
+        SetPort(save);
+    }
 }
 
-static ListHandle MakeList(WindowRef win, short top)
+static ListHandle MakeList(WindowRef win, short top, short bottom)
 {
     Rect view, bounds;
     Point csize;
     short W = ((GrafPtr)win)->portRect.right - ((GrafPtr)win)->portRect.left;
     short H = ((GrafPtr)win)->portRect.bottom - ((GrafPtr)win)->portRect.top;
     ListHandle l;
-    SetRect(&view, 8, top, W - 8 - 15, H - 8);   /* room for the vertical scrollbar */
-    SetRect(&bounds, 0, 0, 0, 1);
+    SetRect(&view, 8, top, W - 8 - 15, H - bottom); /* room for the vertical scrollbar */
+    /* dataBounds: columns = right-left, rows = bottom-top -> ONE column, zero
+     * rows (rows come from LAddRow). 0,0,0,1 was zero columns: LSetCell had no
+     * cell (0,i) to write, so every list rendered empty. */
+    SetRect(&bounds, 0, 0, 1, 0);
     SetPt(&csize, 0, 0);
     l = LNew(&view, &bounds, csize, 0, win, true, false, false, true);
     return l;
@@ -628,7 +650,7 @@ static void OpenQueue(void)
         SetRect(&r, 96, 96, 96 + 320, 96 + 260);
         gQueueWin = NewCWindow(NULL, &r, "\pQueue", true, documentProc, (WindowPtr)-1, true, 0);
         SetPort((GrafPtr)gQueueWin);
-        gQueueList = MakeList(gQueueWin, 8);
+        gQueueList = MakeList(gQueueWin, 8, 8);
     }
     if (!gQueueTx) {
         gQueueTx = cq_tx_new(gHost, gPort, "/spot/api/1/queue");
@@ -656,15 +678,40 @@ static void RunSearch(void)
 static void OpenSearch(void)
 {
     Rect r, er, br;
+    ControlHandle root;
     if (gSearchWin) { SelectWindow(gSearchWin); return; }
     SetRect(&r, 116, 116, 116 + 340, 116 + 280);
     gSearchWin = NewCWindow(NULL, &r, "\pSearch", true, documentProc, (WindowPtr)-1, true, 0);
     SetPort((GrafPtr)gSearchWin);
+    /* Appearance keyboard focus REQUIRES an embedding hierarchy: without a root
+     * control SetKeyboardFocus fails (errNoRootControl) and the edit field can
+     * never take keystrokes. Must precede the NewControl calls so they embed. */
+    CreateRootControl(gSearchWin, &root);
     SetRect(&er, 8, 8, 340 - 8 - 70, 26);
     gSearchEdit = NewControl(gSearchWin, &er, "\p", true, 0, 0, 0, kControlEditTextProc, 0);
     SetRect(&br, 340 - 8 - 64, 6, 340 - 8, 26);
     gSearchBtn = NewControl(gSearchWin, &br, "\pSearch", true, 0, 0, 0, pushButProc, 0);
-    gSearchList = MakeList(gSearchWin, 36);
+    /* Bottom row: enqueue the selected result (double-click still = play now). */
+    SetRect(&br, 8, 280 - 28, 8 + 110, 280 - 8);
+    gQueueAddBtn = NewControl(gSearchWin, &br, "\pAdd to Queue", true, 0, 0, 0, pushButProc, 0);
+    gSearchList = MakeList(gSearchWin, 36, 36);   /* leave room for the button row */
+    /* Focus the field on open so ⌘F -> type -> Return just works. */
+    if (gSearchEdit) SetKeyboardFocus(gSearchWin, gSearchEdit, kControlFocusNextPart);
+}
+
+/* Enqueue the selected search row (`/queue/add`, fire-and-forget). The reply is
+ * a /queue snapshot we discard; PumpAux refreshes the queue window when the
+ * fire completes. Eventually consistent (~1-2 s), like every command. */
+static void QueueSelected(void)
+{
+    Cell c;
+    char euri[128], sel[192];
+    SetPt(&c, 0, 0);
+    if (!gSearchList || !LGetSelect(true, &c, gSearchList)) return;
+    if (c.v < 0 || (size_t)c.v >= gSearchItems.count || !gSearchItems.items[c.v].uri) return;
+    EscInto(gSearchItems.items[c.v].uri, euri, sizeof(euri), 1);   /* keep the colons */
+    snprintf(sel, sizeof(sel), "/spot/api/1/queue/add?%s", euri);
+    StartFire(sel);
 }
 
 /* Close one of the auxiliary windows, freeing its list + items. */
@@ -682,6 +729,7 @@ static void CloseAux(WindowRef win)
         if (gSearchTx) { cq_tx_cancel(gSearchTx); cq_tx_free(gSearchTx); gSearchTx = NULL; }
         DisposeWindow(win);
         gSearchWin = NULL; gSearchList = NULL; gSearchEdit = NULL; gSearchBtn = NULL;
+        gQueueAddBtn = NULL;
     }
 }
 
@@ -697,13 +745,32 @@ static void AuxClick(WindowRef win, Point where)
 
     if (win == gSearchWin && FindControl(where, win, &ctl) && ctl) {
         if (ctl == gSearchBtn) { if (TrackControl(ctl, where, NULL)) RunSearch(); }
-        else if (ctl == gSearchEdit) { HandleControlClick(ctl, where, 0, NULL); }
+        else if (ctl == gQueueAddBtn) { if (TrackControl(ctl, where, NULL)) QueueSelected(); }
+        else if (ctl == gSearchEdit) {
+            /* Appearance edit-text needs explicit keyboard focus — without it
+             * HandleControlKey delivers keystrokes to an unfocused control and
+             * typing never lands. */
+            SetKeyboardFocus(win, ctl, kControlFocusNextPart);
+            HandleControlClick(ctl, where, 0, NULL);
+        }
         return;
     }
-    if (list && LClick(where, 0, list)) {     /* double-click a row -> play it */
+    if (list && LClick(where, 0, list)) {     /* double-click a row */
         Cell c;
         SetPt(&c, 0, 0);
-        if (LGetSelect(true, &c, list)) PlayItem(items, c.v);
+        if (LGetSelect(true, &c, list)) {
+            if (win == gQueueWin) {
+                /* Jump WITHIN the queue: skip forward to the row, consuming it
+                 * on the way (play?uri= here would leave a duplicate behind).
+                 * Ignored while a previous jump is still draining. */
+                if (gSkipsPending == 0 && c.v >= 0 && (size_t)c.v < items->count) {
+                    gSkipsPending = (short)(c.v + 1);
+                    StartFire("/spot/api/1/next");
+                }
+            } else {
+                PlayItem(items, c.v);
+            }
+        }
     }
 }
 
@@ -779,7 +846,22 @@ static void ToggleListen(void)
 /* Advance the search/queue/fire transactions; parse a list reply and fill it. */
 static void PumpAux(void)
 {
-    if (gFire && cq_tx_poll(gFire) != CQ_TX_RUNNING) { cq_tx_free(gFire); gFire = NULL; }
+    if (gFire && cq_tx_poll(gFire) != CQ_TX_RUNNING) {
+        cq_tx_free(gFire); gFire = NULL;
+        if (gSkipsPending > 0) gSkipsPending--;
+        if (gSkipsPending > 0) {
+            /* Mid-jump: chain the next /next; hold the queue refresh until the
+             * whole jump has drained (each hop would refetch pointlessly). */
+            StartFire("/spot/api/1/next");
+        } else if (gQueueWin && !gQueueTx) {
+            /* A command (play / queue-add / end of a jump) just landed: if the
+             * queue window is up, re-fetch it so the change shows without a
+             * close/reopen. Eventually consistent (~1-2 s), so a very fast
+             * refresh can still miss it — the 5 s poll catches up. */
+            gQueueTx = cq_tx_new(gHost, gPort, "/spot/api/1/queue");
+            if (gQueueTx) cq_tx_start(gQueueTx);
+        }
+    }
 
     ServiceAudio();                                       /* non-blocking audio service */
 
@@ -820,7 +902,19 @@ static void PumpAux(void)
             cq_track_list_from_response(&gQueueItems, d, len);
             FillList(gQueueList, &gQueueItems);
             cq_tx_free(gQueueTx); gQueueTx = NULL;
-        } else if (st == CQ_TX_FAILED) { cq_tx_free(gQueueTx); gQueueTx = NULL; }
+            gQueueLast = (unsigned long)TickCount();
+        } else if (st == CQ_TX_FAILED) {
+            cq_tx_free(gQueueTx); gQueueTx = NULL;
+            gQueueLast = (unsigned long)TickCount();
+        }
+    } else if (gQueueWin &&
+               (unsigned long)TickCount() - gQueueLast >= CQ_QUEUE_POLL_TICKS) {
+        /* Keep an open Queue window live (~5 s): the queue changes underneath
+         * us — adds from the search window, tracks being consumed, and
+         * Spotify's "idle player reads as empty" quirk all resolve on the
+         * next poll instead of requiring a close/reopen. */
+        gQueueTx = cq_tx_new(gHost, gPort, "/spot/api/1/queue");
+        if (gQueueTx) cq_tx_start(gQueueTx);
     }
 }
 
@@ -973,7 +1067,15 @@ static void DoMouseDown(EventRecord *ev)
     switch (part) {
         case inMenuBar:   DoMenu(MenuSelect(ev->where));            break;
         case inSysWindow: SystemClick(ev, win);                    break;
-        case inDrag:      DragWindow(win, ev->where, NULL);        break;
+        case inDrag: {
+            /* Classic InterfaceLib needs a REAL bounds rect — NULL is a Carbon
+             * nicety; here it constrains the drag to nothing and the windows
+             * can't be moved at all. Use the full desktop (all monitors). */
+            Rect limit = (*GetGrayRgn())->rgnBBox;
+            InsetRect(&limit, 4, 4);
+            DragWindow(win, ev->where, &limit);
+            break;
+        }
         case inGoAway:
             if (TrackGoAway(win, ev->where)) {
                 if (win == gWindow) gRunning = false;
@@ -1050,8 +1152,18 @@ int main(void)
                         DoMenu(MenuKey(ch));
                     } else if (FrontWindow() == gSearchWin && gSearchEdit) {
                         if (ch == '\r' || ch == '\n') RunSearch();
-                        else HandleControlKey(gSearchEdit,
+                        else {
+                            /* Same port trap as IdleControls: HandleControlKey
+                             * draws the typed character into the CURRENT port,
+                             * which Redraw() leaves on gWindow — set it to the
+                             * search window or keystrokes never appear. */
+                            GrafPtr save;
+                            GetPort(&save);
+                            SetPort((GrafPtr)gSearchWin);
+                            HandleControlKey(gSearchEdit,
                                  (short)((ev.message & keyCodeMask) >> 8), ch, ev.modifiers);
+                            SetPort(save);
+                        }
                     }
                     break;
                 }
@@ -1078,7 +1190,16 @@ int main(void)
         }
         PollNetwork();
         PumpAux();
-        if (gSearchWin) IdleControls(gSearchWin);   /* blink the search caret */
+        if (gSearchWin) {   /* blink the search caret */
+            /* IdleControls draws into the CURRENT port, and Redraw() leaves it
+             * on gWindow — without this the caret blinks into the main window
+             * (over the diagnostics) and the search field never gets one. */
+            GrafPtr save;
+            GetPort(&save);
+            SetPort((GrafPtr)gSearchWin);
+            IdleControls(gSearchWin);
+            SetPort(save);
+        }
 
         {   /* animate the diagnostics ~2x/sec so it's visible the loop is alive */
             unsigned long now = (unsigned long)TickCount();
