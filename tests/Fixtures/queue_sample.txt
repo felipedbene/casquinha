@@ -1,0 +1,103 @@
+api	1
+queue_len	20
+item.0.uri	spotify:track:3FIuBxOxuQ6kYy8JO0gq2a
+item.0.track	Construção
+item.0.artist	Chico Buarque
+item.0.album_id	7yrRo2o4XzDfv3mNnkPRE5
+item.0.duration_ms	383626
+item.1.uri	spotify:track:6b5IOeNjaRN6Vg7Y6bT1EZ
+item.1.track	Pense em mim
+item.1.artist	Leandro & Leonardo, Continental
+item.1.album_id	61MD8Pz2Wa5Ap1dOZc41fI
+item.1.duration_ms	199320
+item.2.uri	spotify:track:3NfxSdJnVdon1axzloJgba
+item.2.track	I Say a Little Prayer
+item.2.artist	Aretha Franklin
+item.2.album_id	55HZ2ectg1mMTEKDqIq3kC
+item.2.duration_ms	216773
+item.3.uri	spotify:track:6393yGahSJ9slVdOwSxOVR
+item.3.track	Pink Pony Club
+item.3.artist	Chappell Roan
+item.3.album_id	0XKconI47eiBP6qPYHsx9f
+item.3.duration_ms	258034
+item.4.uri	spotify:track:0LzrhCZFXW94Y8nwtTuRlw
+item.4.track	Hollaback Girl
+item.4.artist	Gwen Stefani
+item.4.album_id	3Lqn8M0QxPLIPRJ4nUKTGN
+item.4.duration_ms	199853
+item.5.uri	spotify:track:1rIKgCH4H52lrvDcz50hS8
+item.5.track	Lush Life
+item.5.artist	Zara Larsson
+item.5.album_id	5YLRVHDVRw3QqWbeTGpC5B
+item.5.duration_ms	200646
+item.6.uri	spotify:track:5Q0Nhxo0l2bP3pNjpGJwV1
+item.6.track	Party In The U.S.A.
+item.6.artist	Miley Cyrus
+item.6.album_id	64aKkqxc3Ur2LYIKeS5osS
+item.6.duration_ms	202066
+item.7.uri	spotify:track:0PvYd9bLZoIMbVd1TJpeju
+item.7.track	Sexy Iemanjá
+item.7.artist	Pepeu Gomes
+item.7.album_id	0pV48P4dUt5ajWGZpAnvpy
+item.7.duration_ms	221133
+item.8.uri	spotify:track:0hejQ1VJ8ySSTK4DE9EY4v
+item.8.track	Sufoco
+item.8.artist	Alcione
+item.8.album_id	6dadiaGXwknT2ngG6sN4eL
+item.8.duration_ms	243053
+item.9.uri	spotify:track:72yGnYWH021VU6UeAsM7Bd
+item.9.track	Meu Mundo É Hoje (Eu Sou Assim)
+item.9.artist	Paulinho Da Viola
+item.9.album_id	6acEK03JM3ebF4QNJKS7wo
+item.9.duration_ms	188360
+item.10.uri	spotify:track:2tHwzyyOLoWSFqYNjeVMzj
+item.10.track	Please Please Please
+item.10.artist	Sabrina Carpenter
+item.10.album_id	3iPSVi54hsacKKl1xIR2eH
+item.10.duration_ms	186365
+item.11.uri	spotify:track:0SFZ2bE1hVX3k5tECWziYm
+item.11.track	Con la Misma Piedra
+item.11.artist	Julio Iglesias
+item.11.album_id	6zic2LJXY3DaP2DWYVtCdT
+item.11.duration_ms	240093
+item.12.uri	spotify:track:1jgTiNob5cVyXeJ3WgX5bL
+item.12.track	Elizabeth Taylor
+item.12.artist	Taylor Swift
+item.12.album_id	4a6NzYL1YHRUgx9e3YZI6I
+item.12.duration_ms	208291
+item.13.uri	spotify:track:7Bq17tNAUCLceZQOJMnj3D
+item.13.track	Alvorada
+item.13.artist	Cartola
+item.13.album_id	0i9SwtLwZ8cOuH5qtkwTvT
+item.13.duration_ms	158800
+item.14.uri	spotify:track:3QksrtI9VFCBHWA4rgvcV8
+item.14.track	Theme From New York, New York
+item.14.artist	Frank Sinatra
+item.14.album_id	4Cv61B08yHx3fwkylkhCxe
+item.14.duration_ms	206066
+item.15.uri	spotify:track:0KzNGfzbrn1YCbxviwSeGk
+item.15.track	A Menina Dança
+item.15.artist	Baby Do Brasil
+item.15.album_id	3rapqTvQg1mbSj8iWBsURU
+item.15.duration_ms	413866
+item.16.uri	spotify:track:21B4gaTWnTkuSh77iWEXdS
+item.16.track	Juno
+item.16.artist	Sabrina Carpenter
+item.16.album_id	3iPSVi54hsacKKl1xIR2eH
+item.16.duration_ms	223192
+item.17.uri	spotify:track:4XlKmVCdUrFnQnKJvV8sOW
+item.17.track	Eu também quero beijar
+item.17.artist	Pepeu Gomes
+item.17.album_id	5ZwsLgy1XUPIrijDOQjkkM
+item.17.duration_ms	244826
+item.18.uri	spotify:track:5eXgqtg3T8Av0m1FUaGHex
+item.18.track	The Life of a Showgirl (feat. Sabrina Carpenter)
+item.18.artist	Taylor Swift, Sabrina Carpenter
+item.18.album_id	4a6NzYL1YHRUgx9e3YZI6I
+item.18.duration_ms	241766
+item.19.uri	spotify:track:1zNXF2svmdlNxfS5XeNUgr
+item.19.track	Don't Know Why
+item.19.artist	Norah Jones
+item.19.album_id	3ArSFkv4OQOosOvYTrZNIl
+item.19.duration_ms	186251
+ts	1783134528265

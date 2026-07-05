@@ -1,0 +1,13 @@
+api	1
+state	playing
+track	Mamma Mia
+artist	ABBA
+album	Abba
+album_id	1kM6xcSYO5ASJaWgygznL7
+track_id	2TxCwUlqaOH3TIyJqGgR91
+position_ms	3100
+duration_ms	213266
+device	active
+volume	100
+queue_len	20
+ts	1783131226118

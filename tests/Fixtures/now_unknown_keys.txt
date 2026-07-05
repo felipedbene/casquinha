@@ -1,0 +1,6 @@
+api	1
+state	playing
+track	X
+cover_url	http://x/y.png
+future_field	42
+volume	80

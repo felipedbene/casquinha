@@ -1,0 +1,3 @@
+api	1
+error	bad_range
+message	size must be 64, 300 or 640

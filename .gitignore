@@ -1,0 +1,5 @@
+build/
+Casquinha.app/
+*.o
+*.dSYM/
+.DS_Store

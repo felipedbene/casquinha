@@ -1,0 +1,53 @@
+api	1
+result_len	10
+item.0.uri	spotify:track:3FIuBxOxuQ6kYy8JO0gq2a
+item.0.track	Construção
+item.0.artist	Chico Buarque
+item.0.album_id	7yrRo2o4XzDfv3mNnkPRE5
+item.0.duration_ms	383626
+item.1.uri	spotify:track:2GAFZG9Z7UGS1iMm4Idrnr
+item.1.track	Apesar De Você
+item.1.artist	Chico Buarque, MPB4, Quarteto Em Cy
+item.1.album_id	4K3E5bhJb92E7eyeIJ16QR
+item.1.duration_ms	235546
+item.2.uri	spotify:track:0rfbvwLPBLBsEd4Bxz8IVb
+item.2.track	O Que Será (A Flor Da Terra)
+item.2.artist	Chico Buarque, Milton Nascimento
+item.2.album_id	2LxncTIR5lf2dzoZb3QNC6
+item.2.duration_ms	166573
+item.3.uri	spotify:track:6wUp7y502iyWLuLuurlOyw
+item.3.track	A Banda
+item.3.artist	Chico Buarque
+item.3.album_id	4ejwSOS740Jj4z3h4RyxJo
+item.3.duration_ms	131000
+item.4.uri	spotify:track:127twwy3iCo1xBRQHyWetU
+item.4.track	Cotidiano
+item.4.artist	Chico Buarque
+item.4.album_id	7yrRo2o4XzDfv3mNnkPRE5
+item.4.duration_ms	168373
+item.5.uri	spotify:track:2RBQAtDa21nzhSNdJwkopD
+item.5.track	Essa Moça Tá Diferente
+item.5.artist	Chico Buarque
+item.5.album_id	3dbh9K8CNUq8BQcL0VxbZf
+item.5.duration_ms	167880
+item.6.uri	spotify:track:0VUgbCK0k8QWGpLiEV8YYZ
+item.6.track	Cálice
+item.6.artist	Chico Buarque, Milton Nascimento
+item.6.album_id	4K3E5bhJb92E7eyeIJ16QR
+item.6.duration_ms	241866
+item.7.uri	spotify:track:06ND7qqsmIRCuWdQNQIlTE
+item.7.track	Roda-Viva
+item.7.artist	Chico Buarque
+item.7.album_id	3sxAzbLUDuydUwiyWj5kil
+item.7.duration_ms	233400
+item.8.uri	spotify:track:0XI3xzi3W1sBDfri2FKtj9
+item.8.track	João E Maria
+item.8.artist	Nara Leão, Chico Buarque
+item.8.album_id	0D3mPnL97GSsO21X6BD7XV
+item.8.duration_ms	141773
+item.9.uri	spotify:track:4uEYpkj1LftTpAXpUwqQo0
+item.9.track	Samba E Amor
+item.9.artist	Chico Buarque
+item.9.album_id	3dbh9K8CNUq8BQcL0VxbZf
+item.9.duration_ms	199666
+ts	1783134024110
