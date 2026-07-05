@@ -46,6 +46,7 @@
 #include "cq_backoff.h"
 #include "cq_debounce.h"
 #include "cq_track.h"
+#include "cq_pls.h"
 #include "cq_transport.h"
 
 enum {
@@ -58,8 +59,9 @@ enum {
     kAboutItem   = 1,
     kSearchItem  = 1,    /* File menu */
     kQueueItem   = 2,
-    kPrefsItem   = 4,    /* File menu: Search, Queue, -, Preferences, -, Quit */
-    kQuitItem    = 6
+    kListenItem  = 3,
+    kPrefsItem   = 5,    /* Search, Queue, Listen, -, Preferences, -, Quit */
+    kQuitItem    = 7
 };
 
 #define CQ_DEFAULT_HOST "10.0.100.112"  /* server address is a pref (Fio 6) */
@@ -705,10 +707,72 @@ static void AuxClick(WindowRef win, Point where)
     }
 }
 
+/* --- audio: live Icecast MP3 via QuickTime (the deferred, hardest piece) ---
+ * Best-effort: discover the stream URL from /spot/stream.pls (cq_pls), then open
+ * it as a QuickTime URL movie and service it from the loop with MoviesTask.
+ * Classic-QuickTime streaming of a never-ending Icecast feed is finicky; this is
+ * NOT runtime-verified and may need iteration on the VM. */
+static Movie         gMovie = NULL;
+static cq_transport *gPls   = NULL;
+
+static void StopAudio(void)
+{
+    if (gMovie) { StopMovie(gMovie); DisposeMovie(gMovie); gMovie = NULL; }
+}
+
+static void OpenStreamURL(const char *url)
+{
+    Handle urlH;
+    Movie  mov = NULL;
+    short  resID = 0;
+    OSErr  e;
+    size_t n = strlen(url);
+
+    StopAudio();
+    urlH = NewHandle((Size)n + 1);
+    if (!urlH) return;
+    BlockMoveData(url, *urlH, (Size)n + 1);            /* the URL C string, NUL included */
+    e = NewMovieFromDataRef(&mov, newMovieActive, &resID, urlH, URLDataHandlerSubType);
+    DisposeHandle(urlH);
+    if (e != noErr || !mov) return;
+    SetMovieVolume(mov, kFullVolume);
+    StartMovie(mov);
+    gMovie = mov;
+}
+
+/* Listen / Stop toggle. */
+static void ToggleListen(void)
+{
+    if (!gQTOk) return;
+    if (gMovie) { StopAudio(); return; }
+    if (gPls) return;
+    gPls = cq_tx_new(gHost, gPort, "/spot/stream.pls");   /* discover the stream URL */
+    if (gPls) cq_tx_start(gPls);
+}
+
 /* Advance the search/queue/fire transactions; parse a list reply and fill it. */
 static void PumpAux(void)
 {
     if (gFire && cq_tx_poll(gFire) != CQ_TX_RUNNING) { cq_tx_free(gFire); gFire = NULL; }
+
+    if (gMovie) MoviesTask(gMovie, 0);                    /* service the audio stream */
+
+    if (gPls) {
+        cq_tx_status st = cq_tx_poll(gPls);
+        if (st == CQ_TX_DONE) {
+            size_t len = 0;
+            const unsigned char *d = cq_tx_data(gPls, &len);
+            char *body = (char *)malloc(len + 1);
+            if (body) {
+                char *url;
+                memcpy(body, d, len); body[len] = '\0';
+                url = cq_pls_first_url(body);             /* PLS/M3U -> first stream URL */
+                free(body);
+                if (url) { OpenStreamURL(url); free(url); }
+            }
+            cq_tx_free(gPls); gPls = NULL;
+        } else if (st == CQ_TX_FAILED) { cq_tx_free(gPls); gPls = NULL; }
+    }
 
     if (gSearchTx) {
         cq_tx_status st = cq_tx_poll(gSearchTx);
@@ -865,10 +929,11 @@ static void DoMenu(long choice)
             }
             break;
         case kFileMenu:
-            if (item == kSearchItem)     OpenSearch();
-            else if (item == kQueueItem) OpenQueue();
-            else if (item == kPrefsItem) DoPrefs();
-            else if (item == kQuitItem)  gRunning = false;
+            if (item == kSearchItem)      OpenSearch();
+            else if (item == kQueueItem)  OpenQueue();
+            else if (item == kListenItem) ToggleListen();
+            else if (item == kPrefsItem)  DoPrefs();
+            else if (item == kQuitItem)   gRunning = false;
             break;
     }
     HiliteMenu(0);
@@ -995,6 +1060,7 @@ int main(void)
         }
     }
 
+    StopAudio();
     if (gTx) { cq_tx_cancel(gTx); cq_tx_free(gTx); }
     cq_now_free(&gSnap);
     FlushEvents(everyEvent, -1);

@@ -38,6 +38,7 @@ resource 'MENU' (129, "File") {
     {
         "Search...",      noicon, "F", nomark, plain;
         "Queue",          noicon, "U", nomark, plain;
+        "Listen / Stop",  noicon, "T", nomark, plain;
         "-",              noicon, nokey, nomark, plain;
         "Preferences...", noicon, ",", nomark, plain;
         "-",              noicon, nokey, nomark, plain;
