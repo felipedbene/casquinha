@@ -24,6 +24,8 @@
 #include <Devices.h>
 #include <Timer.h>
 #include <Appearance.h>
+#include <TextCommon.h>
+#include <TextEncodingConverter.h>
 
 #include <string.h>
 #include <stdio.h>
@@ -78,20 +80,42 @@ static unsigned long gLastDraw  = 0;
 
 /* -------------------------------------------------------------------------- */
 
+/* The wire is UTF-8; QuickDraw draws MacRoman. Convert at the draw boundary only
+ * (NOTES.md), via the Text Encoding Converter. ASCII passes through unchanged, so
+ * headers/times/numbers are unaffected; accents (ç ã é ê õ) render correctly. */
+static TECObjectRef gConv = NULL;
+
+static short ToMacRoman(const char *s, char *dst, short dstmax)
+{
+    ByteCount srcLen = (ByteCount)strlen(s), srcRead = 0, dstLen = 0;
+    if (gConv) {
+        OSStatus e = TECConvertText(gConv, (ConstTextPtr)s, srcLen, &srcRead,
+                                    (TextPtr)dst, (ByteCount)dstmax, &dstLen);
+        if (e == noErr) return (short)dstLen;
+    }
+    { short n = (short)(srcLen < (ByteCount)dstmax ? srcLen : dstmax);  /* ASCII fallback */
+      memcpy(dst, s, n); return n; }
+}
+
 static void DrawCStr(short x, short y, const char *s)
 {
+    char buf[256];
+    short n = ToMacRoman(s, buf, sizeof(buf));
     MoveTo(x, y);
-    DrawText((Ptr)s, 0, (short)strlen(s));
+    DrawText(buf, 0, n);
 }
 
 /* Apply a theme text color at the current device depth. */
 static void ThemeText(ThemeTextColor c) { SetThemeTextColor(c, gDepth, gIsColor); }
 
-/* Right-align a C string ending at x=right, baseline y. */
+/* Right-align a C string ending at x=right, baseline y (measure the MacRoman). */
 static void DrawCStrRight(short right, short y, const char *s)
 {
-    short w = TextWidth((Ptr)s, 0, (short)strlen(s));
-    DrawCStr(right - w, y, s);
+    char buf[256];
+    short n = ToMacRoman(s, buf, sizeof(buf));
+    short w = TextWidth(buf, 0, n);
+    MoveTo(right - w, y);
+    DrawText(buf, 0, n);
 }
 
 static void FmtTime(char *out, long ms)
@@ -344,6 +368,13 @@ int main(void)
     InitCursor();
 
     RegisterAppearanceClient();               /* opt into the Platinum look */
+
+    {   /* UTF-8 -> MacRoman converter for the draw boundary */
+        TextEncoding utf8 = CreateTextEncoding(kTextEncodingUnicodeV2_0,
+                                kTextEncodingDefaultVariant, kUnicodeUTF8Format);
+        if (TECCreateConverter(&gConv, utf8, kTextEncodingMacRoman) != noErr)
+            gConv = NULL;
+    }
 
     gd = GetMainDevice();                      /* depth/color for theme text */
     if (gd) {

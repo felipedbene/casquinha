@@ -28,6 +28,8 @@ target_link_libraries(Casquinha
     OpenTptInternetLib
     OpenTransportLib
     AppearanceLib          # Platinum theme drawing (DrawThemeTrack, theme colors)
+    TextEncodingConverter  # UTF-8 -> MacRoman at the draw boundary
+    TextCommon
 )
 
 # Smallest possible app: drop unused functions.
