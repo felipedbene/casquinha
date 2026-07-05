@@ -36,7 +36,29 @@ resource 'MENU' (128) {
 resource 'MENU' (129, "File") {
     129, textMenuProc, allEnabled, enabled, "File",
     {
-        "Quit", noicon, "Q", nomark, plain
+        "Preferences...", noicon, ",", nomark, plain;
+        "-",              noicon, nokey, nomark, plain;
+        "Quit",           noicon, "Q", nomark, plain
+    }
+};
+
+/* ---- Preferences dialog (Fio 6): server host + port ---- */
+resource 'DLOG' (129, "Prefs") {
+    { 90, 120, 250, 470 },
+    movableDBoxProc, invisible, noGoAway, 0x0, 129, "gopher-spot Server",
+    noAutoCenter
+};
+
+resource 'DITL' (129) {
+    {
+        { 128, 260, 148, 330 }, Button { enabled, "Save" };
+        { 128, 168, 148, 238 }, Button { enabled, "Cancel" };
+        {  46,  80,  62, 330 }, EditText { enabled, "" };          /* 3: host */
+        {  46,  16,  62,  76 }, StaticText { disabled, "Host:" };  /* 4 */
+        {  76,  80,  92, 180 }, EditText { enabled, "" };          /* 5: port */
+        {  76,  16,  92,  76 }, StaticText { disabled, "Port:" };  /* 6 */
+        {  12,  16,  40, 330 }, StaticText { disabled,
+            "Address of the gopher-spot server (LAN)." };          /* 7 */
     }
 };
 

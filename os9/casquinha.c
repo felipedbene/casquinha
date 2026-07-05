@@ -32,6 +32,8 @@
 #include <ImageCompression.h>
 #include <QDOffscreen.h>
 #include <Components.h>
+#include <Folders.h>
+#include <Files.h>
 
 #include <string.h>
 #include <stdio.h>
@@ -45,17 +47,19 @@
 #include "cq_transport.h"
 
 enum {
-    kMenuBar    = 128,
-    kAppleMenu  = 128,
-    kFileMenu   = 129,
-    kAboutAlert = 128,
-    kMainWindow = 128,
-    kAboutItem  = 1,
-    kQuitItem   = 1
+    kMenuBar     = 128,
+    kAppleMenu   = 128,
+    kFileMenu    = 129,
+    kAboutAlert  = 128,
+    kMainWindow  = 128,
+    kPrefsDialog = 129,
+    kAboutItem   = 1,
+    kPrefsItem   = 1,    /* File menu */
+    kQuitItem    = 3     /* File menu: Preferences, -, Quit */
 };
 
-#define CQ_HOST       "10.0.100.112"
-#define CQ_PORT       70
+#define CQ_DEFAULT_HOST "10.0.100.112"  /* server address is a pref (Fio 6) */
+#define CQ_DEFAULT_PORT 70
 #define CQ_POLL_TICKS 120           /* 2 s at 60 ticks/sec (law 5: >= micro-cache) */
 #define CQ_POLL_CAP   1800          /* back off to at most 30 s on errors (429) */
 
@@ -65,6 +69,8 @@ enum {
 
 static Boolean       gRunning = true;
 static WindowRef     gWindow  = NULL;
+static char          gHost[64] = CQ_DEFAULT_HOST;   /* server address (pref) */
+static int           gPort     = CQ_DEFAULT_PORT;
 static short         gDepth   = 1;       /* main-device depth, for theme colors */
 static Boolean       gIsColor = false;
 static unsigned long gSnapTick = 0;      /* TickCount when gSnap was adopted */
@@ -363,7 +369,7 @@ static int PumpTx(cq_transport **txp, int isPoll)
 static void StartCommand(const char *sel)
 {
     if (gCmd) return;
-    gCmd = cq_tx_new(CQ_HOST, CQ_PORT, sel);
+    gCmd = cq_tx_new(gHost, gPort, sel);
     if (gCmd) cq_tx_start(gCmd);
 }
 
@@ -439,7 +445,7 @@ static void PollNetwork(void)
         strncpy(gCoverReq, gSnap.album_id, sizeof(gCoverReq) - 1);
         gCoverReq[sizeof(gCoverReq) - 1] = '\0';
         snprintf(sel, sizeof(sel), "/spot/api/1/cover/%s/%d", gCoverReq, CQ_COVER_PX);
-        gCover = cq_tx_new(CQ_HOST, CQ_PORT, sel);
+        gCover = cq_tx_new(gHost, gPort, sel);
         if (gCover) cq_tx_start(gCover);
     }
 
@@ -455,7 +461,7 @@ static void PollNetwork(void)
         unsigned long now = (unsigned long)TickCount();
         if (now - gLastPoll >= (unsigned long)cq_backoff_interval(&gBackoff)) {
             gLastPoll = now;                              /* the loop is the only clock */
-            gTx = cq_tx_new(CQ_HOST, CQ_PORT, "/spot/api/1/now");
+            gTx = cq_tx_new(gHost, gPort, "/spot/api/1/now");
             if (gTx) { cq_tx_start(gTx); gPolls++; }
         }
     }
@@ -524,6 +530,110 @@ static void DoContentClick(WindowRef win, Point where)
     }
 }
 
+/* --- preferences: the server address (Fio 6) --- */
+
+static void C2P(const char *c, Str255 p)
+{
+    size_t n = strlen(c);
+    if (n > 255) n = 255;
+    p[0] = (unsigned char)n;
+    memcpy(p + 1, c, n);
+}
+
+static void P2C(ConstStr255Param p, char *c, size_t max)
+{
+    size_t n = p[0];
+    if (n > max - 1) n = max - 1;
+    memcpy(c, p + 1, n);
+    c[n] = '\0';
+}
+
+static void PrefsSpec(FSSpec *spec)
+{
+    short vRef; long dirID;
+    if (FindFolder(kOnSystemDisk, kPreferencesFolderType, kDontCreateFolder,
+                   &vRef, &dirID) == noErr)
+        FSMakeFSSpec(vRef, dirID, "\pCasquinha Prefs", spec);
+}
+
+static void LoadPrefs(void)
+{
+    FSSpec spec;
+    short  ref;
+    long   count = 200;
+    char   buf[256];
+    char  *nl;
+
+    PrefsSpec(&spec);
+    if (FSpOpenDF(&spec, fsRdPerm, &ref) != noErr) return;
+    FSRead(ref, &count, buf);                 /* count comes back = bytes read */
+    FSClose(ref);
+    if (count <= 0) return;
+    buf[count] = '\0';
+    nl = strchr(buf, '\n');
+    if (nl) {
+        int p;
+        *nl = '\0';
+        if (buf[0]) { strncpy(gHost, buf, sizeof(gHost) - 1); gHost[sizeof(gHost) - 1] = '\0'; }
+        p = atoi(nl + 1);
+        if (p > 0 && p < 65536) gPort = p;
+    }
+}
+
+static void SavePrefs(void)
+{
+    FSSpec spec;
+    short  ref;
+    long   count;
+    char   buf[128];
+
+    PrefsSpec(&spec);
+    FSpCreate(&spec, 'Casq', 'TEXT', smSystemScript);   /* harmless if it exists */
+    if (FSpOpenDF(&spec, fsWrPerm, &ref) != noErr) return;
+    snprintf(buf, sizeof(buf), "%s\n%d\n", gHost, gPort);
+    count = (long)strlen(buf);
+    SetEOF(ref, 0);
+    FSWrite(ref, &count, buf);
+    FSClose(ref);
+}
+
+/* Preferences dialog: edit host + port, save, and reconnect. */
+static void DoPrefs(void)
+{
+    DialogPtr d = GetNewDialog(kPrefsDialog, NULL, (WindowPtr)-1);
+    short  item, type;
+    Handle h;
+    Rect   box;
+    Str255 ps;
+    char   pbuf[16];
+
+    if (!d) return;
+
+    GetDialogItem(d, 3, &type, &h, &box);              /* host edit field */
+    C2P(gHost, ps); SetDialogItemText(h, ps);
+    GetDialogItem(d, 5, &type, &h, &box);              /* port edit field */
+    snprintf(pbuf, sizeof(pbuf), "%d", gPort);
+    C2P(pbuf, ps); SetDialogItemText(h, ps);
+    SelectDialogItemText(d, 3, 0, 32767);
+
+    do { ModalDialog(NULL, &item); } while (item != 1 && item != 2);
+
+    if (item == 1) {                                   /* Save */
+        char host[64]; int p;
+        GetDialogItem(d, 3, &type, &h, &box); GetDialogItemText(h, ps); P2C(ps, host, sizeof(host));
+        GetDialogItem(d, 5, &type, &h, &box); GetDialogItemText(h, ps); P2C(ps, pbuf, sizeof(pbuf));
+        p = atoi(pbuf);
+        if (host[0]) { strncpy(gHost, host, sizeof(gHost) - 1); gHost[sizeof(gHost) - 1] = '\0'; }
+        if (p > 0 && p < 65536) gPort = p;
+        SavePrefs();
+        cq_guard_reset(&gGuard);                       /* reconnect: fresh mark, poll now */
+        cq_backoff_init(&gBackoff, CQ_POLL_TICKS, CQ_POLL_CAP);
+        gLastPoll = 0;
+        gCoverAlbum[0] = '\0';                          /* refetch cover from the new host */
+    }
+    DisposeDialog(d);
+}
+
 static void SetUpMenus(void)
 {
     Handle mbar = GetNewMBar(kMenuBar);
@@ -551,7 +661,8 @@ static void DoMenu(long choice)
             }
             break;
         case kFileMenu:
-            if (item == kQuitItem) gRunning = false;
+            if (item == kPrefsItem)      DoPrefs();
+            else if (item == kQuitItem)  gRunning = false;
             break;
     }
     HiliteMenu(0);
@@ -607,6 +718,7 @@ int main(void)
     cq_guard_init(&gGuard);
     cq_backoff_init(&gBackoff, CQ_POLL_TICKS, CQ_POLL_CAP);
     cq_debounce_init(&gDeb);
+    LoadPrefs();                              /* server address from the prefs file */
     memset(&gSnap, 0, sizeof(gSnap));
 
     SetUpMenus();
