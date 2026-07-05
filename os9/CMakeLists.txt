@@ -12,6 +12,7 @@ add_application(Casquinha
     ../src/cq_track.c
     ../src/cq_guard.c
     ../src/cq_debounce.c
+    ../src/cq_backoff.c
     ../src/cq_transport_ot.c      # Open Transport backend (guarded by CQ_OS9)
 )
 

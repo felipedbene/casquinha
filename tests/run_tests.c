@@ -19,6 +19,7 @@ int main(void)
     guard_tests();
     debounce_tests();
     pls_tests();
+    backoff_tests();
     transport_tests();
 
     printf("----------------------------------------\n");

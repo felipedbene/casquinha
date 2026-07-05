@@ -30,6 +30,7 @@
 #include "cq_codec.h"
 #include "cq_now.h"
 #include "cq_guard.h"
+#include "cq_backoff.h"
 #include "cq_transport.h"
 
 enum {
@@ -45,6 +46,7 @@ enum {
 #define CQ_HOST       "10.0.100.112"
 #define CQ_PORT       70
 #define CQ_POLL_TICKS 120           /* 2 s at 60 ticks/sec (law 5: >= micro-cache) */
+#define CQ_POLL_CAP   1800          /* back off to at most 30 s on errors (429) */
 
 /* HiWord/LoWord aren't in the interfaces uniformly; compute them. */
 #define CQ_HIWORD(x) ((short)((x) >> 16))
@@ -55,6 +57,7 @@ static WindowRef     gWindow  = NULL;
 static short         gMonaco  = 4;
 
 static cq_guard      gGuard;
+static cq_backoff    gBackoff;           /* poll cadence, backs off on errors */
 static cq_now        gSnap;              /* current adopted snapshot */
 static Boolean       gHaveSnap = false;
 static Boolean       gOnline   = false;
@@ -115,8 +118,9 @@ static void DrawWindowContents(WindowRef win)
 
     /* runtime diagnostics — the UTM debugging pass */
     TextSize(9);
-    snprintf(line, sizeof(line), "polls=%ld  done=%ld  stat=%d  err=%d  len=%ld",
-             gPolls, gDone, gLastStat, gLastErr, gLastLen);
+    snprintf(line, sizeof(line), "polls=%ld  done=%ld  stat=%d  err=%d  len=%ld  every %lds",
+             gPolls, gDone, gLastStat, gLastErr, gLastLen,
+             (long)(cq_backoff_interval(&gBackoff) / 60));
     DrawCStr(16, 170, line);
     DrawCStr(16, 184, gLastMsg[0] ? gLastMsg : (gOnline ? "online" : "-"));
 }
@@ -152,8 +156,10 @@ static void PollNetwork(void)
                 const char *msg = cq_fields_get(&f, "message");
                 snprintf(gLastMsg, sizeof(gLastMsg), "server: %s%s%s",
                          err, msg ? " - " : "", msg ? msg : "");
+                cq_backoff_fail(&gBackoff);                 /* don't hammer a 429 */
             } else {
                 cq_now tmp;
+                cq_backoff_ok(&gBackoff);                   /* healthy: back to 2 s */
                 cq_now_from_fields(&tmp, &f);
                 if (cq_guard_accept_ts(&gGuard, tmp.ts)) {  /* law 2: ts >= mark */
                     cq_now_free(&gSnap);
@@ -172,6 +178,7 @@ static void PollNetwork(void)
             strncpy(gLastMsg, cq_tx_error_message(gTx), sizeof(gLastMsg) - 1);
             gLastMsg[sizeof(gLastMsg) - 1] = '\0';
             gOnline = false;                              /* keep last snapshot on screen */
+            cq_backoff_fail(&gBackoff);                   /* transport failure: back off too */
             cq_tx_free(gTx); gTx = NULL;
             Redraw();
         }
@@ -180,8 +187,8 @@ static void PollNetwork(void)
 
     {
         unsigned long now = (unsigned long)TickCount();
-        if (now - gLastPoll >= CQ_POLL_TICKS) {           /* the loop is the only clock */
-            gLastPoll = now;
+        if (now - gLastPoll >= (unsigned long)cq_backoff_interval(&gBackoff)) {
+            gLastPoll = now;                              /* the loop is the only clock */
             gTx = cq_tx_new(CQ_HOST, CQ_PORT, "/spot/api/1/now");
             if (gTx) { cq_tx_start(gTx); gPolls++; }
         }
@@ -254,6 +261,7 @@ int main(void)
     if (gMonaco == 0) gMonaco = 4;
 
     cq_guard_init(&gGuard);
+    cq_backoff_init(&gBackoff, CQ_POLL_TICKS, CQ_POLL_CAP);
     memset(&gSnap, 0, sizeof(gSnap));
 
     SetUpMenus();

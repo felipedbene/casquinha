@@ -17,6 +17,7 @@ CORE_SRC = \
 	src/cq_track.c \
 	src/cq_guard.c \
 	src/cq_debounce.c \
+	src/cq_backoff.c \
 	src/cq_pls.c
 
 # Transport: the POSIX impl is the host/test one; the Open Transport impl
@@ -31,6 +32,7 @@ TEST_SRC = \
 	tests/guard_test.c \
 	tests/debounce_test.c \
 	tests/pls_test.c \
+	tests/backoff_test.c \
 	tests/transport_test.c \
 	tests/run_tests.c
 
