@@ -61,6 +61,15 @@ static Boolean       gOnline   = false;
 static cq_transport *gTx       = NULL;   /* in-flight poll, or NULL */
 static unsigned long gLastPoll = 0;
 
+/* --- runtime diagnostics (this is the UTM debugging pass) --- */
+static long          gPolls     = 0;     /* transactions started */
+static long          gDone      = 0;     /* transactions completed */
+static int           gLastStat  = -1;    /* last cq_tx_status seen */
+static int           gLastErr   = 0;     /* last cq_tx_error code */
+static long          gLastLen   = 0;     /* bytes of last reply */
+static char          gLastMsg[128] = "";
+static unsigned long gLastDraw  = 0;
+
 /* -------------------------------------------------------------------------- */
 
 static void DrawCStr(short x, short y, const char *s)
@@ -82,12 +91,7 @@ static void DrawWindowContents(WindowRef win)
 
     TextSize(10);
 
-    if (!gHaveSnap) {
-        DrawCStr(16, 60, gOnline ? "connecting..." : "connecting to 10.0.100.112:70 ...");
-        return;
-    }
-
-    {
+    if (gHaveSnap) {
         const char *word = gSnap.state == CQ_STATE_PLAYING ? "> playing" :
                            gSnap.state == CQ_STATE_PAUSED  ? "|| paused" : "[] stopped";
         long long secs = gSnap.position_ms / 1000;
@@ -105,13 +109,16 @@ static void DrawWindowContents(WindowRef win)
                  gSnap.device == CQ_DEV_ACTIVE ? "device active" :
                  gSnap.device == CQ_DEV_IDLE   ? "device idle"   : "device unknown");
         DrawCStr(16, 136, line);
+    } else {
+        DrawCStr(16, 58, "waiting for first snapshot...");
     }
 
+    /* runtime diagnostics — the UTM debugging pass */
     TextSize(9);
-    if (!gOnline)
-        DrawCStr(16, 168, "offline - retrying");
-    else
-        DrawCStr(16, 168, CQ_HOST ":" "70   polling every 2s");
+    snprintf(line, sizeof(line), "polls=%ld  done=%ld  stat=%d  err=%d  len=%ld",
+             gPolls, gDone, gLastStat, gLastErr, gLastLen);
+    DrawCStr(16, 170, line);
+    DrawCStr(16, 184, gLastMsg[0] ? gLastMsg : (gOnline ? "online" : "-"));
 }
 
 static void Redraw(void)
@@ -125,10 +132,13 @@ static void PollNetwork(void)
 {
     if (gTx) {
         cq_tx_status st = cq_tx_poll(gTx);
+        gLastStat = (int)st;
         if (st == CQ_TX_DONE) {
             size_t len = 0;
             const unsigned char *d = cq_tx_data(gTx, &len);
             cq_now tmp;
+            gLastLen = (long)len;
+            gDone++;
             cq_now_from_response(&tmp, d, len);
             if (cq_guard_accept_ts(&gGuard, tmp.ts)) {   /* law 2: adopt only if ts >= mark */
                 cq_now_free(&gSnap);
@@ -138,9 +148,13 @@ static void PollNetwork(void)
                 cq_now_free(&tmp);                        /* staler replica: drop */
             }
             gOnline = true;
+            gLastMsg[0] = '\0';
             cq_tx_free(gTx); gTx = NULL;
             Redraw();
         } else if (st == CQ_TX_FAILED) {
+            gLastErr = (int)cq_tx_error_code(gTx);
+            strncpy(gLastMsg, cq_tx_error_message(gTx), sizeof(gLastMsg) - 1);
+            gLastMsg[sizeof(gLastMsg) - 1] = '\0';
             gOnline = false;                              /* keep last snapshot on screen */
             cq_tx_free(gTx); gTx = NULL;
             Redraw();
@@ -153,7 +167,7 @@ static void PollNetwork(void)
         if (now - gLastPoll >= CQ_POLL_TICKS) {           /* the loop is the only clock */
             gLastPoll = now;
             gTx = cq_tx_new(CQ_HOST, CQ_PORT, "/spot/api/1/now");
-            if (gTx) cq_tx_start(gTx);
+            if (gTx) { cq_tx_start(gTx); gPolls++; }
         }
     }
 }
@@ -260,6 +274,11 @@ int main(void)
             }
         }
         PollNetwork();
+
+        {   /* animate the diagnostics ~2x/sec so it's visible the loop is alive */
+            unsigned long now = (unsigned long)TickCount();
+            if (now - gLastDraw >= 30) { gLastDraw = now; Redraw(); }
+        }
     }
 
     if (gTx) { cq_tx_cancel(gTx); cq_tx_free(gTx); }
