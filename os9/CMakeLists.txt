@@ -5,8 +5,10 @@ project(Casquinha C)
 # compiles the sources, runs Rez on the .r, and emits the Classic-Mac outputs
 # (.bin / .dsk / APPL). The app links the REAL pure core from ../src.
 add_application(Casquinha
+    CREATOR Casq                 # matches the signature in icon.r; enables the icon
     casquinha.c
     casquinha.r
+    icon.r                       # BNDL/FREF/signature + the otter icon family
     ../src/cq_codec.c
     ../src/cq_now.c
     ../src/cq_track.c
