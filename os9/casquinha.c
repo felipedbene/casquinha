@@ -136,19 +136,35 @@ static void PollNetwork(void)
         if (st == CQ_TX_DONE) {
             size_t len = 0;
             const unsigned char *d = cq_tx_data(gTx, &len);
-            cq_now tmp;
+            cq_fields f;
+            const char *err;
             gLastLen = (long)len;
             gDone++;
-            cq_now_from_response(&tmp, d, len);
-            if (cq_guard_accept_ts(&gGuard, tmp.ts)) {   /* law 2: adopt only if ts >= mark */
-                cq_now_free(&gSnap);
-                gSnap = tmp;
-                gHaveSnap = true;
+            gOnline = true;                               /* we reached the server */
+
+            /* Check for an `error` key FIRST (law 6 / API contract). An error
+             * document (e.g. `error upstream` on a Spotify 429) must NOT be
+             * adopted as a stopped snapshot — that would wipe a good one. */
+            cq_fields_init(&f);
+            cq_fields_parse(&f, d, len);
+            err = cq_fields_get(&f, "error");
+            if (err) {
+                const char *msg = cq_fields_get(&f, "message");
+                snprintf(gLastMsg, sizeof(gLastMsg), "server: %s%s%s",
+                         err, msg ? " - " : "", msg ? msg : "");
             } else {
-                cq_now_free(&tmp);                        /* staler replica: drop */
+                cq_now tmp;
+                cq_now_from_fields(&tmp, &f);
+                if (cq_guard_accept_ts(&gGuard, tmp.ts)) {  /* law 2: ts >= mark */
+                    cq_now_free(&gSnap);
+                    gSnap = tmp;
+                    gHaveSnap = true;
+                    gLastMsg[0] = '\0';
+                } else {
+                    cq_now_free(&tmp);                       /* staler replica: drop */
+                }
             }
-            gOnline = true;
-            gLastMsg[0] = '\0';
+            cq_fields_free(&f);
             cq_tx_free(gTx); gTx = NULL;
             Redraw();
         } else if (st == CQ_TX_FAILED) {
