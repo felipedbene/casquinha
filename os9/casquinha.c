@@ -714,10 +714,13 @@ static void AuxClick(WindowRef win, Point where)
  * NOT runtime-verified and may need iteration on the VM. */
 static Movie         gMovie = NULL;
 static cq_transport *gPls   = NULL;
+static int           gMovieLoading = 0;
+static unsigned long gMovieStart = 0;
 
 static void StopAudio(void)
 {
     if (gMovie) { StopMovie(gMovie); DisposeMovie(gMovie); gMovie = NULL; }
+    gMovieLoading = 0;
 }
 
 static void OpenStreamURL(const char *url)
@@ -732,12 +735,35 @@ static void OpenStreamURL(const char *url)
     urlH = NewHandle((Size)n + 1);
     if (!urlH) return;
     BlockMoveData(url, *urlH, (Size)n + 1);            /* the URL C string, NUL included */
-    e = NewMovieFromDataRef(&mov, newMovieActive, &resID, urlH, URLDataHandlerSubType);
+    /* ASYNC: NewMovieFromDataRef returns immediately; we poll the load state from
+     * the loop (ServiceAudio). A synchronous open of a never-ending Icecast stream
+     * blocks — and on a cooperative OS that FREEZES THE WHOLE MACHINE. Never do
+     * that (NOTES.md). */
+    e = NewMovieFromDataRef(&mov, newMovieActive | newMovieAsyncOK, &resID,
+                            urlH, URLDataHandlerSubType);
     DisposeHandle(urlH);
     if (e != noErr || !mov) return;
     SetMovieVolume(mov, kFullVolume);
-    StartMovie(mov);
     gMovie = mov;
+    gMovieLoading = 1;
+    gMovieStart = (unsigned long)TickCount();
+}
+
+/* Service the audio movie from the event loop; never blocks. */
+static void ServiceAudio(void)
+{
+    if (!gMovie) return;
+    MoviesTask(gMovie, 0);                              /* 0 = do a little, return now */
+    if (gMovieLoading) {
+        long ls = GetMovieLoadState(gMovie);
+        if (ls >= kMovieLoadStatePlaythroughOK) {
+            StartMovie(gMovie);                        /* enough buffered — play */
+            gMovieLoading = 0;
+        } else if (ls == kMovieLoadStateError ||
+                   (long)((unsigned long)TickCount() - gMovieStart) > 900) {  /* ~15 s */
+            StopAudio();                               /* give up rather than hang */
+        }
+    }
 }
 
 /* Listen / Stop toggle. */
@@ -755,7 +781,7 @@ static void PumpAux(void)
 {
     if (gFire && cq_tx_poll(gFire) != CQ_TX_RUNNING) { cq_tx_free(gFire); gFire = NULL; }
 
-    if (gMovie) MoviesTask(gMovie, 0);                    /* service the audio stream */
+    ServiceAudio();                                       /* non-blocking audio service */
 
     if (gPls) {
         cq_tx_status st = cq_tx_poll(gPls);
