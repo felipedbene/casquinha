@@ -30,5 +30,6 @@ void track_tests(void);
 void guard_tests(void);
 void debounce_tests(void);
 void pls_tests(void);
+void transport_tests(void);
 
 #endif /* CQ_TEST_H */

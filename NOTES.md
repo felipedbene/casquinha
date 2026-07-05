@@ -56,11 +56,21 @@ New, OS-9-specific (the §4 escape hatches for this era — the R7 analog):
   (97 checks), fixtures wired via `CQ_FIXTURES`. Done — no Retro68/emulator
   needed, exactly as intended.
 
+## In progress
+
+- **Fio 2 — Transport.** `cq_transport.h` is a poll-driven state-machine seam.
+  - **POSIX impl** (`cq_transport_posix.c`) — done and verified on the host: a
+    localhost loopback unit test (`make test`, 106 checks) *and* a live probe
+    against the real server (`make probe` → parsed `/now` from 10.0.100.112:70).
+  - **Open Transport impl** (`cq_transport_ot.c`) — written; a synchronous +
+    non-blocking endpoint advanced from the event loop, TickCount deadlines.
+    Being **compiled locally with Retro68** (installing now) so the PowerPC/CFM
+    build is checked here, not just on the VM. **UTM is the victory lap** — the
+    final on-hardware run, not where compile errors get found.
+
 ## Next
 
-- **Fio 2 — Transport.** `cq_transport.h` seam; a POSIX impl for a host loopback
-  test (mirrors DeGelato's client state-machine test), then the Open Transport
-  impl for PPC. Enforce the 2 s / 5 s deadlines. Prove OT from UTM against
-  `printf '/spot/api/1/now\r\n' | nc 10.0.100.112 70`.
+- Finish Fio 2: get `cq_transport_ot.c` compiling under Retro68, wire `make app`.
 - Then Fio 3 (now-playing window), 4 (transport controls), 5 (cover), 6 (prefs +
   cache), 7 (search + queue). Gopher browser and audio come later.
+- Ship builds to the OS 9 VM via the netatalk AFP share (see memory).

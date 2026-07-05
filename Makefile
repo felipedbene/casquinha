@@ -19,6 +19,10 @@ CORE_SRC = \
 	src/cq_debounce.c \
 	src/cq_pls.c
 
+# Transport: the POSIX impl is the host/test one; the Open Transport impl
+# (src/cq_transport_ot.c) is compiled only in the ppc app build (-DCQ_OS9).
+NET_SRC = src/cq_transport_posix.c
+
 TEST_SRC = \
 	tests/cq_test.c \
 	tests/codec_test.c \
@@ -27,21 +31,34 @@ TEST_SRC = \
 	tests/guard_test.c \
 	tests/debounce_test.c \
 	tests/pls_test.c \
+	tests/transport_test.c \
 	tests/run_tests.c
 
 FIXTURES = $(CURDIR)/tests/Fixtures
 
-.PHONY: all test clean app
+.PHONY: all test probe clean app
 
 all: test
 
-# Build and run the pure-core suite, fully offline, with the fixtures wired in.
+# Build and run the pure-core + transport suite, fully offline (localhost
+# loopback), with the fixtures wired in.
 test: build/run_tests
 	CQ_FIXTURES=$(FIXTURES) build/run_tests
 
-build/run_tests: $(CORE_SRC) $(TEST_SRC)
+build/run_tests: $(CORE_SRC) $(NET_SRC) $(TEST_SRC)
 	@mkdir -p build
-	$(CC) $(CFLAGS) $(CORE_SRC) $(TEST_SRC) -o $@
+	$(CC) $(CFLAGS) $(CORE_SRC) $(NET_SRC) $(TEST_SRC) -o $@
+
+# End-to-end check against the REAL server (host-side portkit). Override on the
+# command line: make probe HOST=10.0.100.112 PORT=70
+HOST ?= 10.0.100.112
+PORT ?= 70
+probe: build/probe
+	build/probe $(HOST) $(PORT)
+
+build/probe: $(CORE_SRC) $(NET_SRC) tools/probe.c
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(CORE_SRC) $(NET_SRC) tools/probe.c -o $@
 
 clean:
 	rm -rf build Casquinha.app

@@ -19,6 +19,7 @@ int main(void)
     guard_tests();
     debounce_tests();
     pls_tests();
+    transport_tests();
 
     printf("----------------------------------------\n");
     printf("%d checks, %d failed\n", cq_checks, cq_fails);
