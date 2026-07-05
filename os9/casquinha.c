@@ -15,6 +15,8 @@
  */
 #include <Quickdraw.h>
 #include <Windows.h>
+#include <Controls.h>
+#include <ControlDefinitions.h>
 #include <Menus.h>
 #include <Fonts.h>
 #include <Events.h>
@@ -29,11 +31,13 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "cq_codec.h"
 #include "cq_now.h"
 #include "cq_guard.h"
 #include "cq_backoff.h"
+#include "cq_debounce.h"
 #include "cq_transport.h"
 
 enum {
@@ -77,6 +81,16 @@ static int           gLastErr   = 0;     /* last cq_tx_error code */
 static long          gLastLen   = 0;     /* bytes of last reply */
 static char          gLastMsg[128] = "";
 static unsigned long gLastDraw  = 0;
+
+/* --- transport controls (Fio 4) --- */
+static ControlHandle gPrev = NULL, gPlay = NULL, gNext = NULL, gVol = NULL;
+static cq_debounce   gDeb;               /* pre-wire coalescer for prev/next (law 1) */
+static unsigned long gCmdFire = 0;       /* tick to flush the debounced command */
+static cq_transport *gCmd = NULL;        /* in-flight command transaction */
+static unsigned long gVolHold = 0;       /* ignore poll volume until this tick (law 4) */
+
+#define CQ_DEBOUNCE_TICKS 18             /* ~0.3 s settle before a prev/next reaches the wire */
+#define CQ_HOLD_TICKS    180             /* ~3 s single hold window on the volume slider */
 
 /* -------------------------------------------------------------------------- */
 
@@ -135,6 +149,7 @@ static void DrawWindowContents(WindowRef win)
     /* Platinum: fill with the theme window background, not raw white. */
     SetThemeWindowBackground(win, kThemeBrushDialogBackgroundActive, false);
     EraseRect(&pr);
+    DrawControls(win);        /* transport buttons + volume slider (Fio 4) */
 
     /* Header: app name + a green gopher-spot accent rule. */
     TextFont(0); TextFace(bold); TextSize(11);   /* Charcoal, the system font */
@@ -211,22 +226,26 @@ static void DrawWindowContents(WindowRef win)
         { char t[16]; FmtTime(t, durMs); DrawCStrRight(W - 16, 140, t); }
     }
 
-    /* State / volume / device row. */
+    /* "Vol" label to the left of the volume slider. */
+    TextFont(1); TextSize(9);
+    ThemeText(kThemeTextColorDialogInactive);
+    DrawCStr(276, 173, "Vol");
+
+    /* State / device row (below the transport buttons). */
     TextFont(1); TextSize(10);
     ThemeText(kThemeTextColorDialogActive);
-    snprintf(line, sizeof(line), "%s      Volume %d      %s",
+    snprintf(line, sizeof(line), "%s      %s",
              gSnap.state == CQ_STATE_PLAYING ? "Playing" :
              gSnap.state == CQ_STATE_PAUSED  ? "Paused"  : "Stopped",
-             gSnap.volume,
              gSnap.device == CQ_DEV_ACTIVE ? "on gopher-spot" :
              gSnap.device == CQ_DEV_IDLE   ? "playing elsewhere" : "");
-    DrawCStr(16, 166, line);
+    DrawCStr(16, 202, line);
 
     /* A quiet status line only when something's wrong. */
     if (gLastMsg[0]) {
         TextFont(1); TextSize(9);
         ThemeText(kThemeTextColorDialogInactive);
-        DrawCStr(16, 188, gLastMsg);
+        DrawCStr(16, 220, gLastMsg);
     }
 }
 
@@ -235,65 +254,108 @@ static void Redraw(void)
     if (gWindow) DrawWindowContents(gWindow);
 }
 
-/* Advance the live poll. Called every loop pass; never blocks (OT is
- * non-blocking, driven from here per NOTES.md). */
+/* Keep the Play/Pause button title in sync with the current state. */
+static void UpdatePlayTitle(void)
+{
+    if (gPlay)
+        SetControlTitle(gPlay, gSnap.state == CQ_STATE_PLAYING ? "\pPause" : "\pPlay");
+}
+
+/*
+ * Adopt a /now-shaped reply from EITHER a poll or a command. Checks the error
+ * key first (law 6), adopts a healthy snapshot through the ts-guard (laws 2/3),
+ * and drives the backoff. A command's reply is authoritative — it comes through
+ * the same guard, so no catch-up poll storm (law 3).
+ */
+static void AdoptReply(const unsigned char *d, size_t len)
+{
+    cq_fields f;
+    const char *err;
+
+    gLastLen = (long)len;
+    gDone++;
+    gOnline = true;
+
+    cq_fields_init(&f);
+    cq_fields_parse(&f, d, len);
+    err = cq_fields_get(&f, "error");
+    if (err) {
+        if (strcmp(err, "upstream") == 0)
+            snprintf(gLastMsg, sizeof(gLastMsg), "Spotify busy (rate limited) - easing off");
+        else
+            snprintf(gLastMsg, sizeof(gLastMsg), "server error: %s", err);
+        cq_backoff_fail(&gBackoff);
+    } else {
+        cq_now tmp;
+        cq_backoff_ok(&gBackoff);
+        cq_now_from_fields(&tmp, &f);
+        if (cq_guard_accept_ts(&gGuard, tmp.ts)) {
+            int volHeld = (long)((TickCount() - gVolHold)) < 0;  /* within hold window? */
+            int keepVol = gSnap.volume;
+            cq_now_free(&gSnap);
+            gSnap = tmp;
+            gHaveSnap = true;
+            gSnapTick = (unsigned long)TickCount();
+            gLastMsg[0] = '\0';
+            if (volHeld && gHaveSnap) gSnap.volume = keepVol;    /* don't yank a live drag */
+            UpdatePlayTitle();
+            if (gVol && !volHeld && gSnap.volume >= 0)
+                SetControlValue(gVol, gSnap.volume);
+        } else {
+            cq_now_free(&tmp);
+        }
+    }
+    cq_fields_free(&f);
+    Redraw();
+}
+
+/* Advance one gopher transaction (poll or command). Returns 1 when it finished
+ * (and was freed), so the caller can clear its handle. */
+static int PumpTx(cq_transport **txp, int isPoll)
+{
+    cq_transport *tx = *txp;
+    cq_tx_status st = cq_tx_poll(tx);
+    if (isPoll) gLastStat = (int)st;
+    if (st == CQ_TX_DONE) {
+        size_t len = 0;
+        const unsigned char *d = cq_tx_data(tx, &len);
+        AdoptReply(d, len);
+        cq_tx_free(tx); *txp = NULL;
+        return 1;
+    } else if (st == CQ_TX_FAILED) {
+        if (isPoll) gLastErr = (int)cq_tx_error_code(tx);
+        strncpy(gLastMsg, cq_tx_error_message(tx), sizeof(gLastMsg) - 1);
+        gLastMsg[sizeof(gLastMsg) - 1] = '\0';
+        gOnline = false;
+        cq_backoff_fail(&gBackoff);
+        cq_tx_free(tx); *txp = NULL;
+        Redraw();
+        return 1;
+    }
+    return 0;
+}
+
+/* Fire a command over its own transaction (separate from the poll). Drops if a
+ * command is already in flight — the poll reconciles. */
+static void StartCommand(const char *sel)
+{
+    if (gCmd) return;
+    gCmd = cq_tx_new(CQ_HOST, CQ_PORT, sel);
+    if (gCmd) cq_tx_start(gCmd);
+}
+
+/* Advance the live poll + command path. Called every loop pass; never blocks. */
 static void PollNetwork(void)
 {
-    if (gTx) {
-        cq_tx_status st = cq_tx_poll(gTx);
-        gLastStat = (int)st;
-        if (st == CQ_TX_DONE) {
-            size_t len = 0;
-            const unsigned char *d = cq_tx_data(gTx, &len);
-            cq_fields f;
-            const char *err;
-            gLastLen = (long)len;
-            gDone++;
-            gOnline = true;                               /* we reached the server */
+    if (gCmd) PumpTx(&gCmd, 0);
 
-            /* Check for an `error` key FIRST (law 6 / API contract). An error
-             * document (e.g. `error upstream` on a Spotify 429) must NOT be
-             * adopted as a stopped snapshot — that would wipe a good one. */
-            cq_fields_init(&f);
-            cq_fields_parse(&f, d, len);
-            err = cq_fields_get(&f, "error");
-            if (err) {
-                /* Friendly, calm status — an upstream 429 is the bridge being
-                 * Spotify-rate-limited, not a client fault; we ease off and
-                 * recover automatically. */
-                if (strcmp(err, "upstream") == 0)
-                    snprintf(gLastMsg, sizeof(gLastMsg), "Spotify busy (rate limited) - easing off");
-                else
-                    snprintf(gLastMsg, sizeof(gLastMsg), "server error: %s", err);
-                cq_backoff_fail(&gBackoff);                 /* don't hammer a 429 */
-            } else {
-                cq_now tmp;
-                cq_backoff_ok(&gBackoff);                   /* healthy: back to 2 s */
-                cq_now_from_fields(&tmp, &f);
-                if (cq_guard_accept_ts(&gGuard, tmp.ts)) {  /* law 2: ts >= mark */
-                    cq_now_free(&gSnap);
-                    gSnap = tmp;
-                    gHaveSnap = true;
-                    gSnapTick = (unsigned long)TickCount();  /* interpolation origin */
-                    gLastMsg[0] = '\0';
-                } else {
-                    cq_now_free(&tmp);                       /* staler replica: drop */
-                }
-            }
-            cq_fields_free(&f);
-            cq_tx_free(gTx); gTx = NULL;
-            Redraw();
-        } else if (st == CQ_TX_FAILED) {
-            gLastErr = (int)cq_tx_error_code(gTx);
-            strncpy(gLastMsg, cq_tx_error_message(gTx), sizeof(gLastMsg) - 1);
-            gLastMsg[sizeof(gLastMsg) - 1] = '\0';
-            gOnline = false;                              /* keep last snapshot on screen */
-            cq_backoff_fail(&gBackoff);                   /* transport failure: back off too */
-            cq_tx_free(gTx); gTx = NULL;
-            Redraw();
-        }
-        return;
+    /* Flush a debounced prev/next once it settles (law 1: coalesce before wire). */
+    if (cq_debounce_has(&gDeb) && (long)(TickCount() - gCmdFire) >= 0 && !gCmd) {
+        char *sel = cq_debounce_take(&gDeb);
+        if (sel) { StartCommand(sel); free(sel); }
     }
+
+    if (gTx) { PumpTx(&gTx, 1); return; }
 
     {
         unsigned long now = (unsigned long)TickCount();
@@ -306,6 +368,67 @@ static void PollNetwork(void)
 }
 
 /* -------------------------------------------------------------------------- */
+
+/* Create the transport controls (themed by the Appearance Manager). */
+static void MakeControls(WindowRef win)
+{
+    Rect r;
+    short W = ((GrafPtr)win)->portRect.right - ((GrafPtr)win)->portRect.left;
+
+    SetRect(&r,  16, 156,  92, 176); gPrev = NewControl(win, &r, "\pPrev", true, 0, 0, 0, pushButProc, 0);
+    SetRect(&r, 100, 156, 196, 176); gPlay = NewControl(win, &r, "\pPlay", true, 0, 0, 0, pushButProc, 0);
+    SetRect(&r, 204, 156, 264, 176); gNext = NewControl(win, &r, "\pNext", true, 0, 0, 0, pushButProc, 0);
+    /* Volume slider 0..100. */
+    SetRect(&r, 300, 160, W - 16, 176);
+    gVol = NewControl(win, &r, "\p", true, 50, 0, 100, kControlSliderProc, 0);
+}
+
+/* A click in the window content: transport buttons, volume slider, or a seek
+ * on the progress bar. */
+static void DoContentClick(WindowRef win, Point where)
+{
+    ControlHandle ctl;
+    short W = ((GrafPtr)win)->portRect.right - ((GrafPtr)win)->portRect.left;
+    Rect  bar;
+
+    SetPort((GrafPtr)win);
+    GlobalToLocal(&where);
+
+    if (FindControl(where, win, &ctl) && ctl) {
+        if (TrackControl(ctl, where, NULL)) {
+            if (ctl == gPrev) {              /* debounced (law 1) */
+                cq_debounce_set(&gDeb, "/spot/api/1/prev");
+                gCmdFire = (unsigned long)TickCount() + CQ_DEBOUNCE_TICKS;
+            } else if (ctl == gNext) {
+                cq_debounce_set(&gDeb, "/spot/api/1/next");
+                gCmdFire = (unsigned long)TickCount() + CQ_DEBOUNCE_TICKS;
+            } else if (ctl == gPlay) {       /* immediate toggle */
+                StartCommand(gSnap.state == CQ_STATE_PLAYING ?
+                             "/spot/api/1/pause" : "/spot/api/1/play");
+            } else if (ctl == gVol) {        /* commit on mouse-up, then hold (law 4) */
+                char sel[48];
+                snprintf(sel, sizeof(sel), "/spot/api/1/volume?%d", GetControlValue(gVol));
+                gVolHold = (unsigned long)TickCount() + CQ_HOLD_TICKS;
+                StartCommand(sel);
+            }
+        }
+        return;
+    }
+
+    /* Seek: click on the progress bar to jump there. */
+    SetRect(&bar, 16, 108, W - 16, 124);
+    if (gHaveSnap && gSnap.duration_ms > 0 && PtInRect(where, &bar)) {
+        long span = bar.right - bar.left;
+        long frac = where.h - bar.left;
+        long long ms;
+        char sel[48];
+        if (frac < 0) frac = 0;
+        if (frac > span) frac = span;
+        ms = (long long)gSnap.duration_ms * frac / span;
+        snprintf(sel, sizeof(sel), "/spot/api/1/seek?%ld", (long)ms);
+        StartCommand(sel);
+    }
+}
 
 static void SetUpMenus(void)
 {
@@ -350,7 +473,10 @@ static void DoMouseDown(EventRecord *ev)
         case inSysWindow: SystemClick(ev, win);                    break;
         case inDrag:      DragWindow(win, ev->where, NULL);        break;
         case inGoAway:    if (TrackGoAway(win, ev->where)) gRunning = false; break;
-        case inContent:   if (win != FrontWindow()) SelectWindow(win); break;
+        case inContent:
+            if (win != FrontWindow()) SelectWindow(win);
+            else DoContentClick(win, ev->where);
+            break;
     }
 }
 
@@ -384,6 +510,7 @@ int main(void)
 
     cq_guard_init(&gGuard);
     cq_backoff_init(&gBackoff, CQ_POLL_TICKS, CQ_POLL_CAP);
+    cq_debounce_init(&gDeb);
     memset(&gSnap, 0, sizeof(gSnap));
 
     SetUpMenus();
@@ -392,6 +519,7 @@ int main(void)
     if (gWindow) {
         SetThemeWindowBackground(gWindow, kThemeBrushDialogBackgroundActive, false);
         SetPort((GrafPtr)gWindow);
+        MakeControls(gWindow);
         ShowWindow(gWindow);
     }
 
