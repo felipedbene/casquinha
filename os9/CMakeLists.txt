@@ -32,6 +32,7 @@ target_link_libraries(Casquinha
     AppearanceLib          # Platinum theme drawing (DrawThemeTrack, theme colors)
     TextEncodingConverter  # UTF-8 -> MacRoman at the draw boundary
     TextCommon
+    QuickTimeLib           # GraphicsImporter cover-art decode (Fio 5)
 )
 
 # Smallest possible app: drop unused functions.

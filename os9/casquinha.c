@@ -28,6 +28,10 @@
 #include <Appearance.h>
 #include <TextCommon.h>
 #include <TextEncodingConverter.h>
+#include <Movies.h>
+#include <ImageCompression.h>
+#include <QDOffscreen.h>
+#include <Components.h>
 
 #include <string.h>
 #include <stdio.h>
@@ -91,6 +95,14 @@ static unsigned long gVolHold = 0;       /* ignore poll volume until this tick (
 
 #define CQ_DEBOUNCE_TICKS 18             /* ~0.3 s settle before a prev/next reaches the wire */
 #define CQ_HOLD_TICKS    180             /* ~3 s single hold window on the volume slider */
+
+/* --- cover art (Fio 5) --- */
+#define CQ_COVER_PX 64
+static Boolean       gQTOk    = false;   /* QuickTime available (EnterMovies ok) */
+static cq_transport *gCover   = NULL;    /* in-flight cover fetch */
+static GWorldPtr     gCoverGW = NULL;    /* decoded 64x64 cover */
+static char          gCoverAlbum[64] = "";  /* album_id currently decoded (or tried) */
+static char          gCoverReq[64]   = "";  /* album_id being fetched */
 
 /* -------------------------------------------------------------------------- */
 
@@ -241,6 +253,17 @@ static void DrawWindowContents(WindowRef win)
              gSnap.device == CQ_DEV_IDLE   ? "playing elsewhere" : "");
     DrawCStr(16, 202, line);
 
+    /* Album cover (Fio 5), top-right, drawn last so it sits above the text. */
+    if (gCoverGW) {
+        PixMapHandle pm = GetGWorldPixMap(gCoverGW);
+        Rect sr, dr;
+        SetRect(&sr, 0, 0, CQ_COVER_PX, CQ_COVER_PX);
+        SetRect(&dr, W - 16 - CQ_COVER_PX, 44, W - 16, 44 + CQ_COVER_PX);
+        LockPixels(pm);
+        CopyBits((BitMap *)*pm, &((GrafPtr)win)->portBits, &sr, &dr, srcCopy, NULL);
+        UnlockPixels(pm);
+    }
+
     /* A quiet status line only when something's wrong. */
     if (gLastMsg[0]) {
         TextFont(1); TextSize(9);
@@ -344,10 +367,81 @@ static void StartCommand(const char *sel)
     if (gCmd) cq_tx_start(gCmd);
 }
 
+/* Decode JPEG cover bytes into a 64x64 GWorld via QuickTime's GraphicsImporter.
+ * Robust: any failure just leaves the previous cover (or none) in place. */
+static void DecodeCover(const unsigned char *bytes, size_t len)
+{
+    Handle jpeg = NULL, dataRef = NULL;
+    GraphicsImportComponent gi = 0;
+    GWorldPtr gw = NULL, savePort = NULL;
+    GDHandle  saveGD = NULL;
+    Rect r;
+    SetRect(&r, 0, 0, CQ_COVER_PX, CQ_COVER_PX);
+
+    jpeg = NewHandle((Size)len);
+    if (!jpeg) return;
+    BlockMoveData(bytes, *jpeg, (Size)len);
+
+    if (PtrToHand(&jpeg, &dataRef, sizeof(Handle)) != noErr) { DisposeHandle(jpeg); return; }
+    if (GetGraphicsImporterForDataRef(dataRef, 'hndl', &gi) != noErr || !gi) {
+        DisposeHandle(dataRef); DisposeHandle(jpeg); return;
+    }
+
+    GetGWorld(&savePort, &saveGD);
+    if (NewGWorld(&gw, 32, &r, NULL, NULL, 0) == noErr && gw) {
+        PixMapHandle pm = GetGWorldPixMap(gw);
+        LockPixels(pm);
+        SetGWorld(gw, NULL);
+        EraseRect(&r);
+        GraphicsImportSetGWorld(gi, gw, NULL);
+        GraphicsImportSetBoundsRect(gi, &r);
+        GraphicsImportDraw(gi);
+        UnlockPixels(pm);
+    }
+    SetGWorld(savePort, saveGD);
+
+    CloseComponent(gi);
+    DisposeHandle(dataRef);
+    DisposeHandle(jpeg);
+
+    if (gw) {
+        if (gCoverGW) DisposeGWorld(gCoverGW);
+        gCoverGW = gw;
+    }
+}
+
 /* Advance the live poll + command path. Called every loop pass; never blocks. */
 static void PollNetwork(void)
 {
     if (gCmd) PumpTx(&gCmd, 0);
+
+    /* Cover fetch (Fio 5): its reply is JPEG, not /now, so pump it separately. */
+    if (gCover) {
+        cq_tx_status st = cq_tx_poll(gCover);
+        if (st == CQ_TX_DONE) {
+            size_t len = 0;
+            const unsigned char *d = cq_tx_data(gCover, &len);
+            if (cq_data_is_jpeg(d, len)) {   /* law 7: sniff FF D8 before decoding */
+                DecodeCover(d, len);
+                Redraw();
+            }
+            strncpy(gCoverAlbum, gCoverReq, sizeof(gCoverAlbum) - 1);  /* tried; don't refetch */
+            gCoverAlbum[sizeof(gCoverAlbum) - 1] = '\0';
+            cq_tx_free(gCover); gCover = NULL;
+        } else if (st == CQ_TX_FAILED) {
+            cq_tx_free(gCover); gCover = NULL;
+        }
+    }
+    /* Start a cover fetch when the album changes (and QuickTime is available). */
+    if (gQTOk && gHaveSnap && !gCover && gSnap.album_id &&
+        strcmp(gSnap.album_id, gCoverAlbum) != 0) {
+        char sel[96];
+        strncpy(gCoverReq, gSnap.album_id, sizeof(gCoverReq) - 1);
+        gCoverReq[sizeof(gCoverReq) - 1] = '\0';
+        snprintf(sel, sizeof(sel), "/spot/api/1/cover/%s/%d", gCoverReq, CQ_COVER_PX);
+        gCover = cq_tx_new(CQ_HOST, CQ_PORT, sel);
+        if (gCover) cq_tx_start(gCover);
+    }
 
     /* Flush a debounced prev/next once it settles (law 1: coalesce before wire). */
     if (cq_debounce_has(&gDeb) && (long)(TickCount() - gCmdFire) >= 0 && !gCmd) {
@@ -494,6 +588,8 @@ int main(void)
     InitCursor();
 
     RegisterAppearanceClient();               /* opt into the Platinum look */
+
+    gQTOk = (EnterMovies() == noErr);         /* QuickTime for cover-art decode */
 
     {   /* UTF-8 -> MacRoman converter for the draw boundary */
         TextEncoding utf8 = CreateTextEncoding(kTextEncodingUnicodeV2_0,
