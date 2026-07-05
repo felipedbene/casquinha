@@ -23,6 +23,7 @@
 #include <ToolUtils.h>
 #include <Devices.h>
 #include <Timer.h>
+#include <Appearance.h>
 
 #include <string.h>
 #include <stdio.h>
@@ -54,7 +55,9 @@ enum {
 
 static Boolean       gRunning = true;
 static WindowRef     gWindow  = NULL;
-static short         gMonaco  = 4;
+static short         gDepth   = 1;       /* main-device depth, for theme colors */
+static Boolean       gIsColor = false;
+static unsigned long gSnapTick = 0;      /* TickCount when gSnap was adopted */
 
 static cq_guard      gGuard;
 static cq_backoff    gBackoff;           /* poll cadence, backs off on errors */
@@ -81,51 +84,126 @@ static void DrawCStr(short x, short y, const char *s)
     DrawText((Ptr)s, 0, (short)strlen(s));
 }
 
+/* Apply a theme text color at the current device depth. */
+static void ThemeText(ThemeTextColor c) { SetThemeTextColor(c, gDepth, gIsColor); }
+
+/* Right-align a C string ending at x=right, baseline y. */
+static void DrawCStrRight(short right, short y, const char *s)
+{
+    short w = TextWidth((Ptr)s, 0, (short)strlen(s));
+    DrawCStr(right - w, y, s);
+}
+
+static void FmtTime(char *out, long ms)
+{
+    long s = ms / 1000;
+    snprintf(out, 16, "%ld:%02ld", s / 60, s % 60);
+}
+
 static void DrawWindowContents(WindowRef win)
 {
-    char line[128];
+    Rect  pr = ((GrafPtr)win)->portRect;
+    short W  = pr.right - pr.left;
+    char  line[128];
+    Rect  sep;
 
     SetPort((GrafPtr)win);
-    EraseRect(&((GrafPtr)win)->portRect);
+    /* Platinum: fill with the theme window background, not raw white. */
+    SetThemeWindowBackground(win, kThemeBrushDialogBackgroundActive, false);
+    EraseRect(&pr);
 
-    TextFont(gMonaco);
-    TextSize(12);
-    DrawCStr(16, 28, "Casquinha - gopher-spot on Mac OS 9");
-
-    TextSize(10);
-
-    if (gHaveSnap) {
-        const char *word = gSnap.state == CQ_STATE_PLAYING ? "> playing" :
-                           gSnap.state == CQ_STATE_PAUSED  ? "|| paused" : "[] stopped";
-        long long secs = gSnap.position_ms / 1000;
-        long long dur  = gSnap.duration_ms / 1000;
-
-        DrawCStr(16, 58, word);
-        DrawCStr(16, 80, gSnap.track  ? gSnap.track  : "(no track)");
-        DrawCStr(16, 96, gSnap.artist ? gSnap.artist : "");
-        DrawCStr(16, 112, gSnap.album ? gSnap.album : "");
-
-        snprintf(line, sizeof(line), "%ld:%02ld / %ld:%02ld    vol %d    %s",
-                 (long)(secs / 60), (long)(secs % 60),
-                 (long)(dur / 60),  (long)(dur % 60),
-                 gSnap.volume,
-                 gSnap.device == CQ_DEV_ACTIVE ? "device active" :
-                 gSnap.device == CQ_DEV_IDLE   ? "device idle"   : "device unknown");
-        DrawCStr(16, 136, line);
+    /* Header: app name + a green gopher-spot accent rule. */
+    TextFont(0); TextFace(bold); TextSize(11);   /* Charcoal, the system font */
+    ThemeText(kThemeTextColorDialogActive);
+    DrawCStr(16, 22, "Casquinha");
+    TextFace(0);
+    if (gIsColor) {
+        RGBColor green = { 7453, 47545, 21588 };   /* gopher-spot / Spotify green */
+        RGBColor save;
+        GetForeColor(&save);
+        RGBForeColor(&green);
+        SetRect(&sep, 16, 28, W - 16, 30);
+        PaintRect(&sep);
+        RGBForeColor(&save);
     } else {
-        /* No snapshot yet: lead with the friendly status (e.g. the rate-limit
-         * message) rather than a blank "waiting". */
-        DrawCStr(16, 58, gLastMsg[0] ? gLastMsg : "connecting...");
+        SetRect(&sep, 16, 28, W - 16, 29);
+        DrawThemeSeparator(&sep, kThemeStateActive);
     }
 
-    /* runtime diagnostics — the UTM debugging pass */
-    TextSize(9);
-    snprintf(line, sizeof(line), "polls=%ld  done=%ld  stat=%d  err=%d  len=%ld  every %lds",
-             gPolls, gDone, gLastStat, gLastErr, gLastLen,
-             (long)(cq_backoff_interval(&gBackoff) / 60));
-    DrawCStr(16, 170, line);
-    if (gHaveSnap && gLastMsg[0])   /* a good snapshot on screen + a live error */
-        DrawCStr(16, 184, gLastMsg);
+    if (!gHaveSnap) {
+        TextFont(1); TextSize(10);               /* Geneva */
+        ThemeText(kThemeTextColorDialogActive);
+        DrawCStr(16, 64, gLastMsg[0] ? gLastMsg : "Connecting...");
+        return;
+    }
+
+    /* Track title — bold system font; green when actually playing. */
+    TextFont(0); TextFace(bold); TextSize(14);
+    if (gSnap.state == CQ_STATE_PLAYING && gIsColor) {
+        RGBColor green = { 7453, 47545, 21588 }, save;
+        GetForeColor(&save); RGBForeColor(&green);
+        DrawCStr(16, 58, gSnap.track ? gSnap.track : "(no track)");
+        RGBForeColor(&save);
+    } else {
+        ThemeText(kThemeTextColorDialogActive);
+        DrawCStr(16, 58, gSnap.track ? gSnap.track : "(no track)");
+    }
+    TextFace(0);
+
+    /* Artist / album — Geneva, dimmed. */
+    TextFont(1); TextSize(10);
+    ThemeText(kThemeTextColorDialogInactive);
+    DrawCStr(16, 78, gSnap.artist ? gSnap.artist : "");
+    DrawCStr(16, 94, gSnap.album  ? gSnap.album  : "");
+
+    /* Progress bar — native themed track, interpolated between polls. */
+    {
+        long posMs = (long)gSnap.position_ms;
+        long durMs = (long)gSnap.duration_ms;
+        if (gSnap.state == CQ_STATE_PLAYING) {
+            long elapsed = (long)(((TickCount() - gSnapTick) * 1000L) / 60L);
+            posMs += elapsed;
+        }
+        if (posMs < 0) posMs = 0;
+        if (durMs > 0 && posMs > durMs) posMs = durMs;
+
+        if (durMs > 0) {
+            ThemeTrackDrawInfo info;
+            SetRect(&info.bounds, 16, 108, W - 16, 124);
+            info.kind        = kThemeProgressBar;
+            info.min         = 0;
+            info.max         = durMs;
+            info.value       = posMs;
+            info.reserved    = 0;
+            info.attributes  = kThemeTrackHorizontal;
+            info.enableState = kThemeTrackActive;
+            info.filler1     = 0;
+            info.trackInfo.progress.phase = 0;
+            DrawThemeTrack(&info, NULL, NULL, 0);
+        }
+        TextFont(1); TextSize(9);
+        ThemeText(kThemeTextColorDialogInactive);
+        { char t[16]; FmtTime(t, posMs); DrawCStr(16, 140, t); }
+        { char t[16]; FmtTime(t, durMs); DrawCStrRight(W - 16, 140, t); }
+    }
+
+    /* State / volume / device row. */
+    TextFont(1); TextSize(10);
+    ThemeText(kThemeTextColorDialogActive);
+    snprintf(line, sizeof(line), "%s      Volume %d      %s",
+             gSnap.state == CQ_STATE_PLAYING ? "Playing" :
+             gSnap.state == CQ_STATE_PAUSED  ? "Paused"  : "Stopped",
+             gSnap.volume,
+             gSnap.device == CQ_DEV_ACTIVE ? "on gopher-spot" :
+             gSnap.device == CQ_DEV_IDLE   ? "playing elsewhere" : "");
+    DrawCStr(16, 166, line);
+
+    /* A quiet status line only when something's wrong. */
+    if (gLastMsg[0]) {
+        TextFont(1); TextSize(9);
+        ThemeText(kThemeTextColorDialogInactive);
+        DrawCStr(16, 188, gLastMsg);
+    }
 }
 
 static void Redraw(void)
@@ -172,6 +250,7 @@ static void PollNetwork(void)
                     cq_now_free(&gSnap);
                     gSnap = tmp;
                     gHaveSnap = true;
+                    gSnapTick = (unsigned long)TickCount();  /* interpolation origin */
                     gLastMsg[0] = '\0';
                 } else {
                     cq_now_free(&tmp);                       /* staler replica: drop */
@@ -254,7 +333,7 @@ static void DoMouseDown(EventRecord *ev)
 int main(void)
 {
     EventRecord ev;
-    Str255 monaco = "\pMonaco";
+    GDHandle    gd;
 
     InitGraf(&qd.thePort);
     InitFonts();
@@ -264,8 +343,13 @@ int main(void)
     InitDialogs(NULL);
     InitCursor();
 
-    GetFNum(monaco, &gMonaco);
-    if (gMonaco == 0) gMonaco = 4;
+    RegisterAppearanceClient();               /* opt into the Platinum look */
+
+    gd = GetMainDevice();                      /* depth/color for theme text */
+    if (gd) {
+        gDepth   = (**(**gd).gdPMap).pixelSize;
+        gIsColor = TestDeviceAttribute(gd, gdDevType);
+    }
 
     cq_guard_init(&gGuard);
     cq_backoff_init(&gBackoff, CQ_POLL_TICKS, CQ_POLL_CAP);
@@ -275,6 +359,7 @@ int main(void)
 
     gWindow = GetNewWindow(kMainWindow, NULL, (WindowPtr)-1);
     if (gWindow) {
+        SetThemeWindowBackground(gWindow, kThemeBrushDialogBackgroundActive, false);
         SetPort((GrafPtr)gWindow);
         ShowWindow(gWindow);
     }

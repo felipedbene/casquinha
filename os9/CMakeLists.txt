@@ -27,6 +27,7 @@ target_link_libraries(Casquinha
     OpenTptInetPPC
     OpenTptInternetLib
     OpenTransportLib
+    AppearanceLib          # Platinum theme drawing (DrawThemeTrack, theme colors)
 )
 
 # Smallest possible app: drop unused functions.

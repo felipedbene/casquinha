@@ -10,7 +10,7 @@
 
 /* ---- Main document window ---- */
 resource 'WIND' (128, "Casquinha") {
-    { 60, 60, 260, 500 },        /* top, left, bottom, right */
+    { 48, 60, 266, 520 },        /* top, left, bottom, right (218 x 460) */
     documentProc,
     visible,
     goAway,
