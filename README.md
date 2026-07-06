@@ -38,19 +38,23 @@ state entirely in the Toolbox:
   idle state (manual re-wake mid-session; the launch wake is automatic, and
   the buttons retired in b46 — the app runs itself).
 - **Search & Queue** — built into the main window (search field + results list,
-  live queue list); double-click a search hit to play it, or a queue row to
-  jump straight to that track. Nothing playback-related lives in a menu: on a
+  live queue list); double-click a search hit to play it now and continue with
+  the queue, or a queue row to play **from there onward** — both as native
+  Spotify multi-track contexts via `/spot/api/1/play/from`, so advance, next
+  and prev behave natively. Nothing playback-related lives in a menu: on a
   cooperative OS, menu tracking freezes the app — and the audio with it.
 - **Cover art** — QuickTime GraphicsImporter, behind a fail-once cover cache.
 - **Preferences** (⌘,) — the server address, saved to disk.
-- **Audio** (automatic; ⌘T toggles manually) — with a live status readout in
-  the player ("Tuning in… / Buffering… N% / Waiting for Spotify… /
-  Listening") so the silent phases read as progress, not breakage. The
-  stream is the live Icecast MP3, decoded **in-app by minimp3**
-  and played through the Sound Manager (double-buffered `SndChannel`).
-  QuickTime proved unable to open a length-less live stream on OS 9, so the
-  whole path — endless Open Transport read, MP3 frame sync, decode, output —
-  is the project's own code (see NOTES.md for the b13–b21 arc).
+- **Audio** (automatic; ⌘T toggles manually) — with a live, player-aware
+  status readout in radio vocabulary: `tuning in… → buffering… N% → on air`,
+  `playing out… / standing by` when upstream pauses, `waiting for Spotify…`
+  for the genuine anomaly — and an instant `Skipping...` acknowledgment when
+  you hit Next/Prev. The stream is the live Icecast MP3, decoded **in-app by
+  minimp3** and played through the Sound Manager (`SndPlayDoubleBuffer` fed
+  from a PCM ring, ~3 s radio latency with graceful starvation). QuickTime
+  proved unable to open a length-less live stream on OS 9, so the whole path
+  — endless Open Transport read, MP3 frame sync, decode, output — is the
+  project's own code (see NOTES.md for the b13–b49 arc).
 
 Under all of it: **backend-exhaustion hardening + CLIENTS.md compliance** —
 orderly TCP release, suspend/resume, jittered backoff, an in-flight cap, UTF-8
@@ -65,13 +69,14 @@ checks green**, including decoding a captured slice of the real stream). The
 app is classic PowerPC + Open Transport + the Toolbox, cross-built with
 Retro68 and run in **UTM** (QEMU/PPC).
 
-Exercised on the VM (through b42): Now Playing, transport, search, queue
-(add + jump with **native play-from contexts** via gopher-spot's
-`/spot/api/1/play/from`, spec'd from this repo in
-[`design/SPEC-play-from.md`](design/SPEC-play-from.md)), covers, preferences,
-**wake**, and **⌘T audio** (sustained playback, zero underruns, ~3 s radio
-latency with graceful starvation). **Open item:** the full **Fios A–H**
-runtime pass on real hardware.
+Exercised on the VM (through b49; binaries on the
+[releases page](https://github.com/felipedbene/casquinha/releases)):
+auto-start, Now Playing, transport, search, queue (add + jump with **native
+play-from contexts** via gopher-spot's `/spot/api/1/play/from`, spec'd from
+this repo in [`design/SPEC-play-from.md`](design/SPEC-play-from.md)), covers,
+preferences, wake, and the full audio path (sustained playback, zero
+underruns). **Open item:** the full **Fios A–H** runtime pass on real
+hardware.
 
 See [`NOTES.md`](NOTES.md) for the fio-by-fio arc + permanent constraints, and
 [`design/PATTERN-MAP-os9.md`](design/PATTERN-MAP-os9.md) for the DeGelato →
@@ -149,18 +154,28 @@ src/
   cq_backoff.{h,c}       exponential poll backoff + seeded jitter (pure)
   cq_cache.{h,c}         fixed-slot FIFO cover cache; fail-once semantics (pure)
   cq_pls.{h,c}           first stream URL from a PLS/M3U (pure; audio)
-  cq_transport.h         the transport seam
+  cq_mp3.{h,c}           MP3 frame-header parse / confirmed-frame sync (pure; audio)
+  cq_mp3dec.{h,c}        the decode seam wrapping the vendored minimp3 (pure; audio)
+  minimp3.h              vendored public-domain MP3 decoder (one TU, cq_mp3dec.c)
+  cq_transport.h         the transport seam (+ streaming mode, + UDP log mirror)
   cq_transport_ot.c      Open Transport state machine (OS 9, sync+non-blocking)
   cq_transport_posix.c   BSD-socket twin so the seam is host-testable
 os9/
-  casquinha.c            the app: Toolbox glue, event loop, windows (Retro68)
+  casquinha.c            the app: Toolbox glue, event loop, audio engine (Retro68)
   casquinha.r, icon.r    resources + the otter icon family
 tests/
   *_test.c               the offline suite + a tiny runner
-  Fixtures/              now_* + queue/search + cover + stream.pls (copied verbatim)
+  Fixtures/              now_* + queue/search + cover + stream.pls + stream.mp3
+                         (a captured slice of the real mount, decoded in the suite)
+tools/
+  mp3scan.c              mount forensics: frame gaps / format flips in a capture
+  loglisten.py           UDP log listener (make logtail)
+  *.applescript          smoke test over Apple Events + Finder log collection
 design/
   AUDIT-backend-exhaustion.md   exhaustion audit + Fios A–H (UTM pass pending)
   PATTERN-MAP-os9.md            DeGelato -> Mac OS 9.2 mapping
+  SPEC-play-from.md             the cross-repo spec that became /spot/api/1/play/from
+  vm-logs/                      the b13–b38 field logs behind the audio arc
 ```
 
 Prefix **CQ** / `cq_`. The name is *casquinha* — an ice-cream cone; the humblest
