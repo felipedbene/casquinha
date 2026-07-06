@@ -72,7 +72,7 @@ enum {
     kQuitItem    = 3     /* Preferences, -, Quit */
 };
 
-#define CQ_BUILD_TAG "b43"  /* bump on every VM-iteration build (see status row,
+#define CQ_BUILD_TAG "b44"  /* bump on every VM-iteration build (see status row,
                              * the share filenames, and the per-build log name) */
 #define CQ_DEFAULT_HOST "10.0.100.112"  /* server address is a pref (Fio 6) */
 #define CQ_DEFAULT_PORT 70
@@ -641,8 +641,14 @@ static void AdoptReply(const unsigned char *d, size_t len, int isCmd)
              * out the 10 s cadence — event-driven freshness at ~one extra
              * poll per track (b39: the UI felt ~30 s behind). */
             if (tmp.track_id && (!gSnap.track_id ||
-                                 strcmp(tmp.track_id, gSnap.track_id) != 0))
+                                 strcmp(tmp.track_id, gSnap.track_id) != 0)) {
                 gQueueKick = (unsigned long)TickCount() + 120;
+                /* the UI-flip moment, timestamped: ear-vs-UI staleness at
+                 * natural transitions is measurable from the log sink (b44) */
+                DbgLog("now: %s - %s",
+                       tmp.track  ? tmp.track  : "?",
+                       tmp.artist ? tmp.artist : "?");
+            }
             cq_now_free(&gSnap);
             gSnap = tmp;
             gHaveSnap = true;
