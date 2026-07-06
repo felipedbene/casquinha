@@ -14,6 +14,15 @@ long cq_backoff_interval(const cq_backoff *b)
     return b->current;
 }
 
+long cq_backoff_interval_seeded(const cq_backoff *b, unsigned long seed)
+{
+    long span = b->current / 4;
+    unsigned long mix;
+    if (span <= 0) return b->current;
+    mix = seed * 2654435761UL + 40503UL;   /* multiplicative mix; ticks alone are too regular */
+    return b->current + (long)(mix % (unsigned long)(span + 1));
+}
+
 void cq_backoff_ok(cq_backoff *b)
 {
     b->current = b->base;

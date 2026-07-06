@@ -44,6 +44,7 @@
 #include "cq_now.h"
 #include "cq_guard.h"
 #include "cq_backoff.h"
+#include "cq_cache.h"
 #include "cq_debounce.h"
 #include "cq_track.h"
 #include "cq_pls.h"
@@ -64,7 +65,7 @@ enum {
     kQuitItem    = 7
 };
 
-#define CQ_BUILD_TAG "b7"  /* bump on every VM-iteration build (see status row) */
+#define CQ_BUILD_TAG "b9"  /* bump on every VM-iteration build (see status row) */
 #define CQ_DEFAULT_HOST "10.0.100.112"  /* server address is a pref (Fio 6) */
 #define CQ_DEFAULT_PORT 70
 #define CQ_POLL_TICKS 120           /* 2 s at 60 ticks/sec (law 5: >= micro-cache) */
@@ -75,6 +76,7 @@ enum {
 #define CQ_LOWORD(x) ((short)((x) & 0xFFFF))
 
 static Boolean       gRunning = true;
+static Boolean       gSuspended = false; /* in background (Fio C): start no new polls */
 static WindowRef     gWindow  = NULL;
 static char          gHost[64] = CQ_DEFAULT_HOST;   /* server address (pref) */
 static int           gPort     = CQ_DEFAULT_PORT;
@@ -109,13 +111,19 @@ static unsigned long gVolHold = 0;       /* ignore poll volume until this tick (
 #define CQ_DEBOUNCE_TICKS 18             /* ~0.3 s settle before a prev/next reaches the wire */
 #define CQ_HOLD_TICKS    180             /* ~3 s single hold window on the volume slider */
 
-/* --- cover art (Fio 5) --- */
+/* --- cover art (Fio 5; memory discipline from Fio A) --- */
 #define CQ_COVER_PX 64
 static Boolean       gQTOk    = false;   /* QuickTime available (EnterMovies ok) */
 static cq_transport *gCover   = NULL;    /* in-flight cover fetch */
-static GWorldPtr     gCoverGW = NULL;    /* decoded 64x64 cover */
-static char          gCoverAlbum[64] = "";  /* album_id currently decoded (or tried) */
+/* album_id -> decoded GWorld; an entry with a NULL GWorld means "tried, no
+ * image" (failed fetch / not JPEG), so it is never re-requested this run
+ * (CLIENTS.md checklist 6). 64x64x32bpp = 16 KB per decoded slot, <=128 KB. */
+static cq_cache      gCovers;
 static char          gCoverReq[64]   = "";  /* album_id being fetched */
+
+/* --- connection budget (Fio E) --- */
+#define CQ_MAX_INFLIGHT 3      /* automatic starters (cover, queue poll) wait above this */
+static int TxInFlight(void);   /* defined after the last transport global (gPls) */
 
 /* --- search + queue windows (Fio 7) --- */
 static WindowRef     gSearchWin = NULL;
@@ -129,10 +137,14 @@ static cq_transport *gQueueTx = NULL;
 static cq_track_list gQueueItems;
 static unsigned long gQueueLast = 0;        /* last /queue fetch (ticks) */
 #define CQ_QUEUE_POLL_TICKS 300             /* re-fetch every 5 s while the window is open */
+static cq_backoff    gQBackoff;             /* queue re-fetch cadence, backs off on errors (Fio D) */
+static unsigned long gQueueKick = 0;        /* one-shot /queue refetch due at this tick (Fio H); 0 = none */
 /* Double-click row i in the queue = skip forward i+1 times: the Web API has no
  * "jump to queue position" (nor reorder/remove — the queue is append-only), so
  * the jump is expressed as chained /next commands, fired one at a time. */
 static short gSkipsPending = 0;
+static unsigned long gSkipFire = 0;         /* earliest tick for the next chained /next (Fio D) */
+#define CQ_SKIP_GAP_TICKS 30                /* ~0.5 s between chained /next hops */
 static ControlHandle gSearchBtn = NULL;
 static ControlHandle gQueueAddBtn = NULL;   /* "Add to Queue" on the selected search row */
 
@@ -141,7 +153,8 @@ static ControlHandle gQueueAddBtn = NULL;   /* "Add to Queue" on the selected se
 /* The wire is UTF-8; QuickDraw draws MacRoman. Convert at the draw boundary only
  * (NOTES.md), via the Text Encoding Converter. ASCII passes through unchanged, so
  * headers/times/numbers are unaffected; accents (ç ã é ê õ) render correctly. */
-static TECObjectRef gConv = NULL;
+static TECObjectRef gConv = NULL;      /* UTF-8 -> MacRoman (draw boundary) */
+static TECObjectRef gConvOut = NULL;   /* MacRoman -> UTF-8 (wire boundary, Fio F) */
 
 static short ToMacRoman(const char *s, char *dst, short dstmax)
 {
@@ -161,6 +174,23 @@ static void DrawCStr(short x, short y, const char *s)
     short n = ToMacRoman(s, buf, sizeof(buf));
     MoveTo(x, y);
     DrawText(buf, 0, n);
+}
+
+/* The inverse boundary (Fio F): edit-text controls hand back MacRoman, but the
+ * wire is UTF-8 — percent-encoding raw MacRoman bytes mangles accents on the
+ * server ("Construção" must leave as constru%C3%A7%C3%A3o). ASCII passes
+ * through unchanged on the no-converter fallback. */
+static void ToUTF8(const char *mac, char *dst, size_t dstmax)
+{
+    ByteCount srcLen = (ByteCount)strlen(mac), srcRead = 0, dstLen = 0;
+    if (gConvOut) {
+        OSStatus e = TECConvertText(gConvOut, (ConstTextPtr)mac, srcLen, &srcRead,
+                                    (TextPtr)dst, (ByteCount)(dstmax - 1), &dstLen);
+        if (e == noErr) { dst[dstLen] = '\0'; return; }
+    }
+    { size_t n = strlen(mac);
+      if (n > dstmax - 1) n = dstmax - 1;
+      memcpy(dst, mac, n); dst[n] = '\0'; }
 }
 
 /* Apply a theme text color at the current device depth. */
@@ -288,15 +318,19 @@ static void DrawWindowContents(WindowRef win)
              CQ_BUILD_TAG);
     DrawCStr(16, 202, line);
 
-    /* Album cover (Fio 5), top-right, drawn last so it sits above the text. */
-    if (gCoverGW) {
-        PixMapHandle pm = GetGWorldPixMap(gCoverGW);
-        Rect sr, dr;
-        SetRect(&sr, 0, 0, CQ_COVER_PX, CQ_COVER_PX);
-        SetRect(&dr, W - 16 - CQ_COVER_PX, 44, W - 16, 44 + CQ_COVER_PX);
-        LockPixels(pm);
-        CopyBits((BitMap *)*pm, &((GrafPtr)win)->portBits, &sr, &dr, srcCopy, NULL);
-        UnlockPixels(pm);
+    /* Album cover (Fio 5), top-right, drawn last so it sits above the text.
+     * Looked up by the CURRENT album_id — never a stale neighbor's cover. */
+    if (gSnap.album_id) {
+        GWorldPtr gw = (GWorldPtr)cq_cache_get(&gCovers, gSnap.album_id);
+        if (gw) {
+            PixMapHandle pm = GetGWorldPixMap(gw);
+            Rect sr, dr;
+            SetRect(&sr, 0, 0, CQ_COVER_PX, CQ_COVER_PX);
+            SetRect(&dr, W - 16 - CQ_COVER_PX, 44, W - 16, 44 + CQ_COVER_PX);
+            LockPixels(pm);
+            CopyBits((BitMap *)*pm, &((GrafPtr)win)->portBits, &sr, &dr, srcCopy, NULL);
+            UnlockPixels(pm);
+        }
     }
 
     /* A quiet status line only when something's wrong. */
@@ -338,11 +372,17 @@ static void AdoptReply(const unsigned char *d, size_t len)
     cq_fields_parse(&f, d, len);
     err = cq_fields_get(&f, "error");
     if (err) {
-        if (strcmp(err, "upstream") == 0)
-            snprintf(gLastMsg, sizeof(gLastMsg), "Spotify busy (rate limited) - easing off");
-        else
+        /* Switch on the CODE only; message text is not part of the contract.
+         * rate_limited = the bridge sits inside Spotify's cooldown answering
+         * from cache — keep the last snapshot AND the normal cadence
+         * (CLIENTS.md g6, Fio G); backing off here only staled the UI. Every
+         * other code (upstream, ...) backs the poll off as before. */
+        if (strcmp(err, "rate_limited") == 0) {
+            snprintf(gLastMsg, sizeof(gLastMsg), "Spotify busy - holding steady");
+        } else {
             snprintf(gLastMsg, sizeof(gLastMsg), "server error: %s", err);
-        cq_backoff_fail(&gBackoff);
+            cq_backoff_fail(&gBackoff);
+        }
     } else {
         cq_now tmp;
         cq_backoff_ok(&gBackoff);
@@ -378,6 +418,9 @@ static int PumpTx(cq_transport **txp, int isPoll)
         size_t len = 0;
         const unsigned char *d = cq_tx_data(tx, &len);
         AdoptReply(d, len);
+        /* A command reply IS the fresh snapshot — push the next poll a full
+         * interval out (CLIENTS.md checklist 4: no /now within ~1 s, Fio G). */
+        if (!isPoll) gLastPoll = (unsigned long)TickCount();
         cq_tx_free(tx); *txp = NULL;
         return 1;
     } else if (st == CQ_TX_FAILED) {
@@ -403,8 +446,8 @@ static void StartCommand(const char *sel)
 }
 
 /* Decode JPEG cover bytes into a 64x64 GWorld via QuickTime's GraphicsImporter.
- * Robust: any failure just leaves the previous cover (or none) in place. */
-static void DecodeCover(const unsigned char *bytes, size_t len)
+ * Returns the GWorld (caller owns it — DisposeGWorld) or NULL on any failure. */
+static GWorldPtr DecodeCover(const unsigned char *bytes, size_t len)
 {
     Handle jpeg = NULL, dataRef = NULL;
     GraphicsImportComponent gi = 0;
@@ -414,12 +457,12 @@ static void DecodeCover(const unsigned char *bytes, size_t len)
     SetRect(&r, 0, 0, CQ_COVER_PX, CQ_COVER_PX);
 
     jpeg = NewHandle((Size)len);
-    if (!jpeg) return;
+    if (!jpeg) return NULL;
     BlockMoveData(bytes, *jpeg, (Size)len);
 
-    if (PtrToHand(&jpeg, &dataRef, sizeof(Handle)) != noErr) { DisposeHandle(jpeg); return; }
+    if (PtrToHand(&jpeg, &dataRef, sizeof(Handle)) != noErr) { DisposeHandle(jpeg); return NULL; }
     if (GetGraphicsImporterForDataRef(dataRef, 'hndl', &gi) != noErr || !gi) {
-        DisposeHandle(dataRef); DisposeHandle(jpeg); return;
+        DisposeHandle(dataRef); DisposeHandle(jpeg); return NULL;
     }
 
     GetGWorld(&savePort, &saveGD);
@@ -439,10 +482,7 @@ static void DecodeCover(const unsigned char *bytes, size_t len)
     DisposeHandle(dataRef);
     DisposeHandle(jpeg);
 
-    if (gw) {
-        if (gCoverGW) DisposeGWorld(gCoverGW);
-        gCoverGW = gw;
-    }
+    return gw;
 }
 
 /* Advance the live poll + command path. Called every loop pass; never blocks. */
@@ -450,26 +490,31 @@ static void PollNetwork(void)
 {
     if (gCmd) PumpTx(&gCmd, 0);
 
-    /* Cover fetch (Fio 5): its reply is JPEG, not /now, so pump it separately. */
+    /* Cover fetch (Fio 5): its reply is JPEG, not /now, so pump it separately.
+     * EVERY outcome — decoded, not-JPEG, transport failure — is recorded in
+     * gCovers, so an album is requested at most once per run (Fio A: before
+     * this, a FAILED fetch left no mark and was retried every loop pass). */
     if (gCover) {
         cq_tx_status st = cq_tx_poll(gCover);
-        if (st == CQ_TX_DONE) {
-            size_t len = 0;
-            const unsigned char *d = cq_tx_data(gCover, &len);
-            if (cq_data_is_jpeg(d, len)) {   /* law 7: sniff FF D8 before decoding */
-                DecodeCover(d, len);
-                Redraw();
+        if (st != CQ_TX_RUNNING) {
+            GWorldPtr gw = NULL, old;
+            if (st == CQ_TX_DONE) {
+                size_t len = 0;
+                const unsigned char *d = cq_tx_data(gCover, &len);
+                if (cq_data_is_jpeg(d, len))   /* law 7: sniff FF D8 before decoding */
+                    gw = DecodeCover(d, len);
             }
-            strncpy(gCoverAlbum, gCoverReq, sizeof(gCoverAlbum) - 1);  /* tried; don't refetch */
-            gCoverAlbum[sizeof(gCoverAlbum) - 1] = '\0';
-            cq_tx_free(gCover); gCover = NULL;
-        } else if (st == CQ_TX_FAILED) {
+            old = (GWorldPtr)cq_cache_put(&gCovers, gCoverReq, gw);
+            if (old) DisposeGWorld(old);
+            if (gw) Redraw();
             cq_tx_free(gCover); gCover = NULL;
         }
     }
-    /* Start a cover fetch when the album changes (and QuickTime is available). */
-    if (gQTOk && gHaveSnap && !gCover && gSnap.album_id &&
-        strcmp(gSnap.album_id, gCoverAlbum) != 0) {
+    /* Start a cover fetch only for an album never tried this run — and only
+     * in the foreground, under the connection budget (Fios C/E). */
+    if (gQTOk && gHaveSnap && !gCover && !gSuspended &&
+        TxInFlight() < CQ_MAX_INFLIGHT && gSnap.album_id &&
+        !cq_cache_has(&gCovers, gSnap.album_id)) {
         char sel[96];
         strncpy(gCoverReq, gSnap.album_id, sizeof(gCoverReq) - 1);
         gCoverReq[sizeof(gCoverReq) - 1] = '\0';
@@ -486,9 +531,11 @@ static void PollNetwork(void)
 
     if (gTx) { PumpTx(&gTx, 1); return; }
 
-    {
+    if (!gSuspended) {   /* background starts no polls; resume kicks one (Fio C) */
         unsigned long now = (unsigned long)TickCount();
-        if (now - gLastPoll >= (unsigned long)cq_backoff_interval(&gBackoff)) {
+        /* seeded = interval + up to 25% positive jitter (Fio D): several
+         * clients desynchronize, and the base never gets FASTER (law 5). */
+        if (now - gLastPoll >= (unsigned long)cq_backoff_interval_seeded(&gBackoff, now)) {
             gLastPoll = now;                              /* the loop is the only clock */
             gTx = cq_tx_new(gHost, gPort, "/spot/api/1/now");
             if (gTx) { cq_tx_start(gTx); gPolls++; }
@@ -660,7 +707,7 @@ static void OpenQueue(void)
 
 static void RunSearch(void)
 {
-    char q[128], eq[400], sel[440];
+    char q[128], q8[384], eq[1160], sel[1200];
     Size got = 0;
     if (!gSearchEdit) return;
     GetControlData(gSearchEdit, kControlNoPart, kControlEditTextTextTag,
@@ -668,7 +715,8 @@ static void RunSearch(void)
     if (got < 0) got = 0;
     q[got] = '\0';
     if (!q[0]) return;
-    EscInto(q, eq, sizeof(eq), 0);
+    ToUTF8(q, q8, sizeof(q8));       /* MacRoman field -> UTF-8 wire (Fio F) */
+    EscInto(q8, eq, sizeof(eq), 0);
     snprintf(sel, sizeof(sel), "/spot/api/1/search?q=%s", eq);
     if (gSearchTx) { cq_tx_cancel(gSearchTx); cq_tx_free(gSearchTx); }
     gSearchTx = cq_tx_new(gHost, gPort, sel);
@@ -721,6 +769,7 @@ static void CloseAux(WindowRef win)
         if (gQueueList) LDispose(gQueueList);
         cq_track_list_free(&gQueueItems);
         if (gQueueTx) { cq_tx_cancel(gQueueTx); cq_tx_free(gQueueTx); gQueueTx = NULL; }
+        gQueueKick = 0;                       /* a pending kick dies with the window */
         DisposeWindow(win);
         gQueueWin = NULL; gQueueList = NULL;
     } else if (win == gSearchWin) {
@@ -783,6 +832,17 @@ static Movie         gMovie = NULL;
 static cq_transport *gPls   = NULL;
 static int           gMovieLoading = 0;
 static unsigned long gMovieStart = 0;
+
+/* Every transport that can be in flight at once (Fio E): poll, command,
+ * cover, fire, search, queue and pls each ride their own connection, so one
+ * client could hold 7 sockets on a fork-per-connection server. The automatic
+ * starters (cover, queue poll) wait while at the budget; user-initiated
+ * transactions are never gated. */
+static int TxInFlight(void)
+{
+    return (gTx ? 1 : 0) + (gCmd ? 1 : 0) + (gCover ? 1 : 0) + (gFire ? 1 : 0) +
+           (gSearchTx ? 1 : 0) + (gQueueTx ? 1 : 0) + (gPls ? 1 : 0);
+}
 
 static void StopAudio(void)
 {
@@ -850,18 +910,22 @@ static void PumpAux(void)
         cq_tx_free(gFire); gFire = NULL;
         if (gSkipsPending > 0) gSkipsPending--;
         if (gSkipsPending > 0) {
-            /* Mid-jump: chain the next /next; hold the queue refresh until the
-             * whole jump has drained (each hop would refetch pointlessly). */
-            StartFire("/spot/api/1/next");
-        } else if (gQueueWin && !gQueueTx) {
-            /* A command (play / queue-add / end of a jump) just landed: if the
-             * queue window is up, re-fetch it so the change shows without a
-             * close/reopen. Eventually consistent (~1-2 s), so a very fast
-             * refresh can still miss it — the 5 s poll catches up. */
-            gQueueTx = cq_tx_new(gHost, gPort, "/spot/api/1/queue");
-            if (gQueueTx) cq_tx_start(gQueueTx);
+            /* Mid-jump: pace the chain ~0.5 s per hop (Fio D) — every /next is
+             * a Spotify call server-side; back-to-back hops read as a burst.
+             * The queue refresh holds until the whole jump has drained. */
+            gSkipFire = (unsigned long)TickCount() + CQ_SKIP_GAP_TICKS;
+        } else if (gQueueWin) {
+            /* A command (play / queue-add / end of a jump) just landed. The
+             * server is eventually consistent (~1-2 s), so schedule ONE
+             * refetch ~2 s out (Fio H, CLIENTS.md g13) instead of refetching
+             * instantly and usually missing the change. */
+            gQueueKick = (unsigned long)TickCount() + 120;
         }
     }
+    /* Fire the next paced hop of a queue jump once its gap has passed. */
+    if (gSkipsPending > 0 && !gFire &&
+        (long)((unsigned long)TickCount() - gSkipFire) >= 0)
+        StartFire("/spot/api/1/next");
 
     ServiceAudio();                                       /* non-blocking audio service */
 
@@ -903,18 +967,26 @@ static void PumpAux(void)
             FillList(gQueueList, &gQueueItems);
             cq_tx_free(gQueueTx); gQueueTx = NULL;
             gQueueLast = (unsigned long)TickCount();
+            cq_backoff_ok(&gQBackoff);
         } else if (st == CQ_TX_FAILED) {
             cq_tx_free(gQueueTx); gQueueTx = NULL;
             gQueueLast = (unsigned long)TickCount();
+            cq_backoff_fail(&gQBackoff);   /* failing? re-fetch slower (Fio D) */
         }
-    } else if (gQueueWin &&
-               (unsigned long)TickCount() - gQueueLast >= CQ_QUEUE_POLL_TICKS) {
-        /* Keep an open Queue window live (~5 s): the queue changes underneath
-         * us — adds from the search window, tracks being consumed, and
-         * Spotify's "idle player reads as empty" quirk all resolve on the
-         * next poll instead of requiring a close/reopen. */
-        gQueueTx = cq_tx_new(gHost, gPort, "/spot/api/1/queue");
-        if (gQueueTx) cq_tx_start(gQueueTx);
+    } else if (gQueueWin && !gSuspended && TxInFlight() < CQ_MAX_INFLIGHT) {
+        /* Keep an open Queue window live (~5 s, backing off on errors): the
+         * queue changes underneath us — adds from the search window, tracks
+         * being consumed, and Spotify's "idle player reads as empty" quirk all
+         * resolve on the next poll instead of requiring a close/reopen. The
+         * kick (Fio H) is the one-shot post-command refetch. */
+        unsigned long now = (unsigned long)TickCount();
+        int due = now - gQueueLast >= (unsigned long)cq_backoff_interval(&gQBackoff);
+        if (gQueueKick && (long)(now - gQueueKick) >= 0) due = 1;
+        if (due) {
+            gQueueKick = 0;
+            gQueueTx = cq_tx_new(gHost, gPort, "/spot/api/1/queue");
+            if (gQueueTx) cq_tx_start(gQueueTx);
+        }
     }
 }
 
@@ -1016,8 +1088,12 @@ static void DoPrefs(void)
         SavePrefs();
         cq_guard_reset(&gGuard);                       /* reconnect: fresh mark, poll now */
         cq_backoff_init(&gBackoff, CQ_POLL_TICKS, CQ_POLL_CAP);
+        cq_backoff_init(&gQBackoff, CQ_QUEUE_POLL_TICKS, CQ_POLL_CAP);
         gLastPoll = 0;
-        gCoverAlbum[0] = '\0';                          /* refetch cover from the new host */
+        while (cq_cache_count(&gCovers) > 0) {          /* refetch covers from the new host */
+            GWorldPtr gw = (GWorldPtr)cq_cache_take_oldest(&gCovers);
+            if (gw) DisposeGWorld(gw);
+        }
     }
     DisposeDialog(d);
 }
@@ -1107,11 +1183,13 @@ int main(void)
 
     gQTOk = (EnterMovies() == noErr);         /* QuickTime for cover-art decode */
 
-    {   /* UTF-8 -> MacRoman converter for the draw boundary */
+    {   /* converters: UTF-8 -> MacRoman (draw) and MacRoman -> UTF-8 (wire) */
         TextEncoding utf8 = CreateTextEncoding(kTextEncodingUnicodeV2_0,
                                 kTextEncodingDefaultVariant, kUnicodeUTF8Format);
         if (TECCreateConverter(&gConv, utf8, kTextEncodingMacRoman) != noErr)
             gConv = NULL;
+        if (TECCreateConverter(&gConvOut, kTextEncodingMacRoman, utf8) != noErr)
+            gConvOut = NULL;
     }
 
     gd = GetMainDevice();                      /* depth/color for theme text */
@@ -1122,6 +1200,8 @@ int main(void)
 
     cq_guard_init(&gGuard);
     cq_backoff_init(&gBackoff, CQ_POLL_TICKS, CQ_POLL_CAP);
+    cq_backoff_init(&gQBackoff, CQ_QUEUE_POLL_TICKS, CQ_POLL_CAP);
+    cq_cache_init(&gCovers);
     cq_debounce_init(&gDeb);
     LoadPrefs();                              /* server address from the prefs file */
     memset(&gSnap, 0, sizeof(gSnap));
@@ -1138,8 +1218,9 @@ int main(void)
 
     while (gRunning) {
         /* Short sleep while a fetch is in flight (spin the OT state machine),
-         * calmer when idle between polls. */
-        long sleep = gTx ? 1L : 10L;
+         * calmer when idle between polls, calmer still suspended in the
+         * background — unless audio is playing, which wants regular service. */
+        long sleep = gTx ? 1L : ((gSuspended && !gMovie) ? 60L : 10L);
         if (WaitNextEvent(everyEvent, &ev, sleep, NULL)) {
             switch (ev.what) {
                 case mouseDown:
@@ -1184,6 +1265,16 @@ int main(void)
                     EndUpdate(win);
                     break;
                 }
+                case osEvt:
+                    /* Suspend/resume (Fio C; SIZE has acceptSuspendResumeEvents):
+                     * in the background no NEW polls start (PollNetwork/PumpAux
+                     * check gSuspended) — in-flight transactions still drain and
+                     * ⌘T audio plays on. Resume kicks an immediate /now. */
+                    if (((ev.message >> 24) & 0xFF) == suspendResumeMessage) {
+                        gSuspended = (ev.message & resumeFlag) == 0;
+                        if (!gSuspended) gLastPoll = 0;
+                    }
+                    break;
                 default:
                     break;
             }

@@ -102,6 +102,26 @@ with Retro68 and on the share, pending the UTM runtime pass.
 - **Audio (⌘T).** QuickTime URL movie from `/spot/stream.pls` (`cq_pls`). **The
   one unverified piece** — classic-QT Icecast streaming is finicky; needs VM
   testing, may need a Sound Manager / movie-import fallback.
+- **Fio A (exhaustion audit, b8) — cover fail-once + tried-set.** New pure
+  module `cq_cache` (fixed-slot FIFO, NULL value = "tried, no image"): every
+  /cover outcome is remembered, so a failing fetch is no longer retried every
+  loop pass (the retry storm that was exhausting gopher-spot) and each album is
+  requested at most once per run (CLIENTS.md checklist 6). Draw looks the cover
+  up by the current `album_id`. Host-tested (`cache_test.c`); **needs the UTM
+  pass** — see `design/AUDIT-backend-exhaustion.md` for the audit + Fios B–H.
+- **Fios B–H (exhaustion audit + CLIENTS.md compliance, b9).** B: the success
+  path now completes the orderly release (`OTSndOrderlyDisconnect` on T_ORDREL)
+  so the server gets FIN, not RST. C: custom `SIZE` (accept suspend/resume +
+  canBackground) + `osEvt` handling — no NEW polls in the background, in-flight
+  drains, audio plays on, resume polls immediately. D: seeded positive jitter
+  (`cq_backoff_interval_seeded`, host-tested), queue re-fetch backs off on
+  errors, chained /next hops paced ~0.5 s. E: automatic starters (cover, queue
+  poll) wait above 3 in-flight connections. F: search converts MacRoman→UTF-8
+  (second TEC converter) before percent-encoding — `Construção` leaves as
+  `constru%C3%A7%C3%A3o`. G: `rate_limited` keeps cadence + snapshot (no
+  backoff); command replies push the next /now a full interval out. H: post-add
+  queue refetch is a single kick ~2 s later (eventual consistency window).
+  All **need the UTM pass**; per-fio verification steps in the audit doc.
 
 ## Next (for the human)
 

@@ -26,6 +26,13 @@ void cq_backoff_init(cq_backoff *b, long base, long cap);
 /* The interval the caller should wait before the next poll. */
 long cq_backoff_interval(const cq_backoff *b);
 
+/* interval() plus deterministic POSITIVE jitter derived from seed: a value in
+ * [current, current + current/4]. Jitter only ever waits LONGER, so the base
+ * cadence keeps honoring law 5 (poll no faster than the micro-cache) while
+ * multiple clients desynchronize. Pure — the caller supplies the entropy (the
+ * OS 9 app passes TickCount); equal seeds give equal results. */
+long cq_backoff_interval_seeded(const cq_backoff *b, unsigned long seed);
+
 /* A healthy (error-free) reply: reset to the base cadence. */
 void cq_backoff_ok(cq_backoff *b);
 

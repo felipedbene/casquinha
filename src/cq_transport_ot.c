@@ -256,6 +256,11 @@ static void pump_recv(cq_transport *t)
             OTResult look = OTLook(t->ep);
             if (look == T_ORDREL) {              /* orderly release == EOF */
                 OTRcvOrderlyDisconnect(t->ep);
+                /* Answer with OUR half of the release before closing: without
+                 * it the close is abortive (RST) and the server, waiting in
+                 * FIN_WAIT for our FIN, logs a reset on EVERY successful
+                 * transaction (Fio B). */
+                OTSndOrderlyDisconnect(t->ep);
                 OTUnbind(t->ep);
                 OTCloseProvider(t->ep);
                 t->ep = kOTInvalidEndpointRef;
@@ -275,8 +280,10 @@ static void pump_recv(cq_transport *t)
             }
             return;
         }
-        /* any other negative result: if we already have bytes, deliver them */
+        /* any other negative result: if we already have bytes, deliver them
+         * (best-effort orderly release first — connection state is unknown) */
         if (t->len > 0) {
+            OTSndOrderlyDisconnect(t->ep);
             OTUnbind(t->ep); OTCloseProvider(t->ep); t->ep = kOTInvalidEndpointRef;
             t->status = CQ_TX_DONE; t->st = ST_DONE;
         } else {

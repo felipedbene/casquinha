@@ -1,12 +1,46 @@
 /*
  * casquinha.r — resources for the Mac OS 9 app (Fio 3).
- * RetroPPCAPPL.r supplies the standard 'cfrg' + 'SIZE'; we add the window,
- * the menu bar, and the About box.
+ * The 'cfrg' + 'SIZE' are inlined (not RetroPPCAPPL.r) because Fio C needs a
+ * custom SIZE: acceptSuspendResumeEvents so the event loop can pause polling
+ * in the background, and canBackground so an in-flight transaction still
+ * drains (instead of stalling with the server holding the socket) and the
+ * ⌘T audio stream keeps playing while the app is behind another.
  */
-#include "RetroPPCAPPL.r"
+#include "Processes.r"
+#include "CodeFragments.r"
 #include "Windows.r"
 #include "Menus.r"
 #include "Dialogs.r"
+
+resource 'cfrg' (0) {
+    {
+        kPowerPCCFragArch, kIsCompleteCFrag, kNoVersionNum, kNoVersionNum,
+        kDefaultStackSize, kNoAppSubFolder,
+        kApplicationCFrag, kDataForkCFragLocator, kZeroOffset, kCFragGoesToEOF,
+        "Casquinha"
+    }
+};
+
+resource 'SIZE' (-1) {
+    reserved,
+    acceptSuspendResumeEvents,   /* Fio C: osEvt drives the poll pause */
+    reserved,
+    canBackground,               /* drain in-flight tx + service audio behind */
+    doesActivateOnFGSwitch,
+    backgroundAndForeground,
+    dontGetFrontClicks,
+    ignoreChildDiedEvents,
+    is32BitCompatible,
+    notHighLevelEventAware,
+    onlyLocalHLEvents,
+    notStationeryAware,
+    dontUseTextEditServices,
+    reserved,
+    reserved,
+    reserved,
+    1536 * 1024,                 /* preferred: room for the 8-slot cover cache (Fio A) */
+    1024 * 1024                  /* minimum: unchanged from the toolchain default */
+};
 
 /* ---- Main document window ---- */
 resource 'WIND' (128, "Casquinha") {

@@ -20,6 +20,7 @@ int main(void)
     debounce_tests();
     pls_tests();
     backoff_tests();
+    cache_tests();
     transport_tests();
 
     printf("----------------------------------------\n");
