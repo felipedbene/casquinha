@@ -1,8 +1,10 @@
 # Casquinha
 
 A native **Mac OS 9.2** Spotify remote — *the essential Radinho, on the oldest
-machine yet* — speaking the frozen **gopher-spot machine API `/spot/api/1`** over
-raw gopher (RFC 1436), LAN-only. It is the PowerPC / Classic sibling of
+machine yet* — speaking the frozen
+**[gopher-spot](https://github.com/felipedbene/gopher-spot) machine API
+`/spot/api/1`** over raw gopher (RFC 1436), LAN-only. It is the PowerPC / Classic
+sibling of
 [DeToca](https://github.com/felipedbene/detoca) (Snow Leopard 10.6 / i386) and
 [DeGelato](https://github.com/felipedbene/degelato) (Sorbet Leopard 10.5 / ppc),
 and the third reference implementation of the umbrella recipe,
@@ -16,25 +18,44 @@ verbatim; only the glue and the platform escape-hatches change. Casquinha is tha
 claim taken to its limit: no Cocoa, no Objective-C, no BSD sockets, no threads —
 just plain C, **Open Transport**, and the **Toolbox** on a cooperative event loop.
 
+## What it does
+
+A full native remote for the gopher-spot bridge, driving Spotify and showing
+state entirely in the Toolbox:
+
+- **Now Playing** — a Platinum window polling `/now` every 2 s over Open
+  Transport, interpolating the progress bar from `ts` between polls, with a
+  monotonic guard so a stale reply never rewinds the display. TEC UTF-8→MacRoman
+  for accented names; graceful 429 backoff.
+- **Transport** — prev / play-pause / next, a volume slider, and a click-to-seek
+  progress bar.
+- **Wake** (⌘K) — transfer playback onto the gopher-spot librespot device so the
+  audio stream carries it, recovering the "playing on another device" idle state.
+- **Search & Queue** (⌘F / ⌘U) — List Manager windows; double-click a search hit
+  to play it, or a queue row to jump straight to that track.
+- **Cover art** — QuickTime GraphicsImporter, behind a fail-once cover cache.
+- **Preferences** (⌘,) — the server address, saved to disk.
+- **Audio** (⌘T) — the live Icecast MP3 stream via QuickTime. Best-effort; MacAST
+  parked on the stream is the reliable fallback.
+
+Under all of it: **backend-exhaustion hardening + CLIENTS.md compliance** —
+orderly TCP release, suspend/resume, jittered backoff, an in-flight cap, UTF-8
+search encoding, `rate_limited` degradation, and a single polite queue re-poll
+after a change. See [`design/AUDIT-backend-exhaustion.md`](design/AUDIT-backend-exhaustion.md).
+
 ## Status
 
-A full native Mac OS 9 client. The pure core (Codec / Model / Reconciler) is
-plain C99 with an offline suite that runs **on a modern Mac** — no Retro68, no
-emulator (`make test`, 117 checks green). The app is classic PowerPC + Open
-Transport + the Toolbox, cross-built with Retro68.
+The pure core (Codec / Model / Reconciler) is plain C99 with an offline suite
+that runs **on a modern Mac** — no Retro68, no emulator (`make test`, **156
+checks green**). The app is classic PowerPC + Open Transport + the Toolbox,
+cross-built with Retro68 and run in **UTM** (QEMU/PPC).
 
-- **Fios 0–3** — scaffold, pure core, transport seam, and the **Platinum
-  now-playing window** polling live over Open Transport (2 s → `cq_guard` →
-  render; TEC UTF-8→MacRoman; graceful 429 backoff). *Validated on the VM.*
-- **Fio 4** — transport controls (prev/play-pause/next, volume, seek).
-- **Fio 5** — album cover art (QuickTime GraphicsImporter).
-- **Fio 6** — preferences (configurable server address, ⌘,).
-- **Fio 7** — search + queue windows (List Manager, ⌘F / ⌘U).
-- **Icon** — the otter, as a classic `ICN#`/`icl8` family.
-- **Audio (⌘T)** — live Icecast MP3 via QuickTime (best-effort; the one piece
-  still to be verified on the VM).
+Exercised on the VM: Now Playing, transport, search, queue (incl. add + jump),
+covers, and preferences. **Open items:** confirming the new **wake** command,
+the **⌘T audio** path, and the full **Fios A–H** runtime pass on real/emulated
+hardware.
 
-See [`NOTES.md`](NOTES.md) for the full arc + permanent constraints, and
+See [`NOTES.md`](NOTES.md) for the fio-by-fio arc + permanent constraints, and
 [`design/PATTERN-MAP-os9.md`](design/PATTERN-MAP-os9.md) for the DeGelato →
 Mac OS 9.2 mapping.
 
@@ -62,7 +83,7 @@ wired up from Fio 3 on (`make app`, once `RETRO68=<toolchain>` is set).
   read to EOF. `/now` returns UTF-8 `key<TAB>value` lines.
 - **Ignore unknown keys, tolerate missing ones, key off `state` first** — the API
   is additive; surface growth must never hard-fail the client.
-- The server micro-caches `/now` (~1 s); poll at 2 s and never faster.
+- The server micro-caches `/now` (~3 s); poll at 2 s and never faster.
 
 Capture a fresh fixture from the live server:
 
@@ -74,15 +95,26 @@ printf '/spot/api/1/now\r\n' | nc 10.0.100.112 70 > tests/Fixtures/now_live.txt
 
 ```
 src/
-  cq_codec.{h,c}     raw bytes -> {key:value} fields; JPEG magic-byte sniff (pure)
-  cq_now.{h,c}       immutable /now snapshot; state-first; interpolation (pure)
-  cq_track.{h,c}     item.<i>.* rows for /queue and /search (pure)
-  cq_guard.{h,c}     monotonic ts-guard — MANDATORY (law 2) (pure)
-  cq_debounce.{h,c}  pre-wire coalescer — cancel != un-send (law 1) (pure)
-  cq_pls.{h,c}       first stream URL from a PLS/M3U (pure; for later audio)
+  cq_codec.{h,c}         raw bytes -> {key:value} fields; JPEG magic-byte sniff (pure)
+  cq_now.{h,c}           immutable /now snapshot; state-first; interpolation (pure)
+  cq_track.{h,c}         item.<i>.* rows for /queue and /search (pure)
+  cq_guard.{h,c}         monotonic ts-guard — MANDATORY (law 2) (pure)
+  cq_debounce.{h,c}      pre-wire coalescer — cancel != un-send (law 1) (pure)
+  cq_backoff.{h,c}       exponential poll backoff + seeded jitter (pure)
+  cq_cache.{h,c}         fixed-slot FIFO cover cache; fail-once semantics (pure)
+  cq_pls.{h,c}           first stream URL from a PLS/M3U (pure; audio)
+  cq_transport.h         the transport seam
+  cq_transport_ot.c      Open Transport state machine (OS 9, sync+non-blocking)
+  cq_transport_posix.c   BSD-socket twin so the seam is host-testable
+os9/
+  casquinha.c            the app: Toolbox glue, event loop, windows (Retro68)
+  casquinha.r, icon.r    resources + the otter icon family
 tests/
-  *_test.c           the offline suite + a tiny runner
-  Fixtures/          now_* + queue/search + cover + stream.pls (copied verbatim)
+  *_test.c               the offline suite + a tiny runner
+  Fixtures/              now_* + queue/search + cover + stream.pls (copied verbatim)
+design/
+  AUDIT-backend-exhaustion.md   exhaustion audit + Fios A–H (UTM pass pending)
+  PATTERN-MAP-os9.md            DeGelato -> Mac OS 9.2 mapping
 ```
 
 Prefix **CQ** / `cq_`. The name is *casquinha* — an ice-cream cone; the humblest
