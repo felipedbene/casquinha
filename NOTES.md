@@ -167,6 +167,13 @@ with Retro68 and on the share, pending the UTM runtime pass.
   "Test Casquinha" drives launch→listen→search→add→next→wake→stop→quit with
   paced delays, and "Collect Logs" has the Finder copy every
   `Casquinha b*.log` onto the AFP share.
+- **Auto-start matrix (b47).** The single launch wake hiccupped in the
+  field: `wake?play=1` on a PAUSED-but-active device does NOT resume
+  (transfer-to-self no-op; the user sat in silence 17 s and pressed Next).
+  Now the first snapshot decides like a human: playing→nothing,
+  paused-on-device→plain `/play` resume, stopped-on-device→play the visible
+  queue head once the first /queue lands (gAutoPlayPending — /queue isn't
+  in yet at first-/now time), off-device/idle→wake?play=1.
 - **Button retirement (b46).** Auto-start (b43) + the status readout (b45)
   made the Listen/Stop and Wake buttons ceremonial — removed; ⌘T/⌘K and
   the AppleScript commands are the manual levers. The shelf is one row

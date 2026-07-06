@@ -72,7 +72,7 @@ enum {
     kQuitItem    = 3     /* Preferences, -, Quit */
 };
 
-#define CQ_BUILD_TAG "b46"  /* bump on every VM-iteration build (see status row,
+#define CQ_BUILD_TAG "b47"  /* bump on every VM-iteration build (see status row,
                              * the share filenames, and the per-build log name) */
 #define CQ_DEFAULT_HOST "10.0.100.112"  /* server address is a pref (Fio 6) */
 #define CQ_DEFAULT_PORT 70
@@ -542,6 +542,8 @@ static char gFallbackUri[128] = "";
  * the OPTION key at launch skips it all. */
 static int gAutoStart = 1;
 static int gAutoWoke  = 0;
+static int gAutoPlayPending = 0;   /* stopped-at-launch: play the queue head
+                                      once the first /queue snapshot lands */
 
 /* The row AFTER the current track in the visible queue — the client-side
  * "play from here onward" cursor (b40). Spotify cannot jump into a queue, so
@@ -672,22 +674,36 @@ static void AdoptReply(const unsigned char *d, size_t len, int isCmd)
             UpdatePlayTitle();
             if (gVol && !volHeld && gSnap.volume >= 0)
                 SetControlValue(gVol, gSnap.volume);
-            /* Auto-wake off the FIRST snapshot (b43): if playback isn't
-             * already on the gopher-spot device, transfer it here — the
-             * same command as the Wake button, once per launch, decided on
-             * real state instead of blindly. Stealing from another device
-             * is the point ("when I open the app I want to listen"). */
+            /* Auto-start off the FIRST snapshot (b43, matrix refined in b47
+             * after a launch hickup: wake?play=1 on a PAUSED-but-active
+             * device does NOT resume — transfer-to-self is a no-op, the b35
+             * field dance). Decide like a human would:
+             *   playing on the device  -> nothing;
+             *   paused  on the device  -> plain resume (/play), no transfer;
+             *   stopped on the device  -> the context is dead; play the
+             *       visible queue head — but /queue hasn't landed yet at
+             *       first-/now time, so defer via gAutoPlayPending;
+             *   anywhere else / idle   -> wake?play=1 (transfer + play). */
             if (gAutoStart && !gAutoWoke) {
                 gAutoWoke = 1;
-                if (gSnap.state == CQ_STATE_PLAYING &&
-                    gSnap.device == CQ_DEV_ACTIVE) {
-                    DbgLog("auto: already playing on gopher-spot");
+                if (gSnap.device == CQ_DEV_ACTIVE) {
+                    if (gSnap.state == CQ_STATE_PLAYING) {
+                        DbgLog("auto: already playing on gopher-spot");
+                    } else if (gSnap.state == CQ_STATE_PAUSED) {
+                        DbgLog("auto: resume on launch (paused on device)");
+                        StartCommand("/spot/api/1/play");
+                    } else {
+                        DbgLog("auto: stopped on device - queue head once it loads");
+                        gAutoPlayPending = 1;
+                    }
                 } else {
                     DbgLog("auto: wake on launch (state=%d dev=%d)",
                            (int)gSnap.state, (int)gSnap.device);
                     StartCommand("/spot/api/1/wake?play=1");
                 }
             }
+            if (gAutoPlayPending && gSnap.state == CQ_STATE_PLAYING)
+                gAutoPlayPending = 0;          /* it recovered by itself */
         } else {
             cq_now_free(&tmp);
         }
@@ -1715,6 +1731,16 @@ static void PumpAux(void)
                 gQueueItems = fresh;
                 FillList(gQueueList, &gQueueItems);
                 gQueueEmptyRuns = 0;
+                if (gAutoPlayPending) {
+                    /* launch found the device stopped (dead context); now
+                     * that the queue is visible, play its head (b47) */
+                    gAutoPlayPending = 0;
+                    if (gSnap.state != CQ_STATE_PLAYING) {
+                        DbgLog("auto: play queue head on launch (%ld queued)",
+                               (long)gQueueItems.count);
+                        PlayFrom(&gQueueItems, 0, NULL);
+                    }
+                }
             } else {
                 cq_track_list_free(&fresh);
                 if (++gQueueEmptyRuns == 2 && gQueueItems.count > 0) {
