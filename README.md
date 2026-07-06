@@ -78,11 +78,15 @@ present:
 
 - every event is appended to **`Casquinha <tag>.log`** next to the app (one
   log per build, flushed per line so it survives a freeze), and
-- each line is **mirrored live as a UDP datagram** to the dev machine —
-  run `make logtail` on the host (a tiny Python listener; macOS `nc -kul`
-  latches onto the first sender and drops the rest) and watch the VM narrate
-  itself in real time. The marker file's first line can override the mirror
-  target as `host:port`.
+- each line is **mirrored live as a UDP datagram**. Two sinks exist: the
+  cluster's always-on **log-sink** (a MetalLB service at
+  `10.0.100.114:5514`, deployed with gopher-spot; read it with
+  `kubectl -n gopher-spot logs -f deploy/log-sink` — lines are prefixed
+  with the sender IP so all family clients can share it), or an ad-hoc
+  `make logtail` on the dev Mac (a tiny Python listener; macOS `nc -kul`
+  latches onto the first sender and drops the rest). The marker file's
+  first line selects the target as `host:port` — put
+  `10.0.100.114:5514` in it for the cluster sink.
 
 Delete the marker and the app goes quiet again. Extras in `tools/`:
 `mp3scan.c` (mount forensics: frame gaps/format flips in a captured stream),
