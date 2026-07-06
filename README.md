@@ -42,7 +42,10 @@ state entirely in the Toolbox:
   cooperative OS, menu tracking freezes the app — and the audio with it.
 - **Cover art** — QuickTime GraphicsImporter, behind a fail-once cover cache.
 - **Preferences** (⌘,) — the server address, saved to disk.
-- **Audio** (⌘T, or the Listen⇄Stop toggle) — the live Icecast MP3 stream, decoded **in-app by minimp3**
+- **Audio** (⌘T, or the Listen⇄Stop toggle) — with a live status readout in
+  the player ("Tuning in… / Buffering… N% / Waiting for Spotify… /
+  Listening") so the silent phases read as progress, not breakage. The
+  stream is the live Icecast MP3, decoded **in-app by minimp3**
   and played through the Sound Manager (double-buffered `SndChannel`).
   QuickTime proved unable to open a length-less live stream on OS 9, so the
   whole path — endless Open Transport read, MP3 frame sync, decode, output —

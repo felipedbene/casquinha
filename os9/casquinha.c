@@ -72,7 +72,7 @@ enum {
     kQuitItem    = 3     /* Preferences, -, Quit */
 };
 
-#define CQ_BUILD_TAG "b44"  /* bump on every VM-iteration build (see status row,
+#define CQ_BUILD_TAG "b45"  /* bump on every VM-iteration build (see status row,
                              * the share filenames, and the per-build log name) */
 #define CQ_DEFAULT_HOST "10.0.100.112"  /* server address is a pref (Fio 6) */
 #define CQ_DEFAULT_PORT 70
@@ -108,6 +108,12 @@ static int           gLastErr   = 0;     /* last cq_tx_error code */
 static long          gLastLen   = 0;     /* bytes of last reply */
 static char          gLastMsg[128] = "";
 static unsigned long gLastDraw  = 0;
+
+/* Audio status line (b45) — defined with the audio engine, drawn in the
+ * player's status row so the silent phases (tuning/prebuffer/dry mount)
+ * read as WORK IN PROGRESS instead of "broken", which is what made users
+ * re-click (and a second Listen click is a Stop). */
+static void AudioStatusStr(char *out, size_t cap);
 
 /* --- debug log: OPT-IN via a marker file (b42). When a file named
  * "Casquinha Debug" sits next to the app, every DbgLog line goes to
@@ -431,6 +437,13 @@ static void DrawWindowContents(WindowRef win)
              gSnap.device == CQ_DEV_IDLE   ? "playing elsewhere" : "",
              CQ_BUILD_TAG);
     DrawCStr(16, 202, line);
+
+    {   /* the audio engine narrating itself, right-aligned on the same row;
+         * the 2 Hz animator makes "Buffering... N%" tick up live (b45) */
+        char aud[48];
+        AudioStatusStr(aud, sizeof(aud));
+        if (aud[0]) DrawCStrRight(W - 16, 202, aud);
+    }
 
     /* Album cover (Fio 5), top-right, drawn last so it sits above the text.
      * Looked up by the CURRENT album_id — never a stale neighbor's cover. */
@@ -1206,6 +1219,8 @@ static long           gTrims = 0;                 /* trims this listen */
 static long           gPcmTotal = 0;              /* PCM bytes decoded this listen */
 static long           gDecTicks = 0;              /* ticks spent inside the decoder */
 static long           gDecFrames = 0;             /* frames decoded this listen */
+static unsigned long  gStarveUntil = 0;           /* show "Buffering" until this tick */
+static int            gMountDry = 0;              /* rx parked >3 s while playing */
 static unsigned long  gAuBeat = 0;                /* heartbeat log tick */
 static long           gRxTotal = 0;               /* stream bytes received this listen */
 
@@ -1296,6 +1311,8 @@ static void StopAudio(const char *why)
     gPlaying = 0;
     gRingWr = gRingRd = 0;
     gRingSkip = 0;
+    gStarveUntil = 0;
+    gMountDry = 0;
     if (gListenBtn) SetControlTitle(gListenBtn, "\pListen");   /* toggle shows state */
 }
 
@@ -1518,6 +1535,25 @@ static void ServiceAudio(void)
     if (gAuSt == AU_PLAY) {
         PumpRing();
         if (gAuSt != AU_PLAY) return;   /* the pump may give up and stop */
+        {   /* status tells (b45): starvation (interrupt served silence) and
+             * a dry mount (rx parked while playing = Spotify isn't sending;
+             * the right lever is Play/Wake, not Listen). */
+            static long          prevSil = 0;
+            static long          prevRx  = -1;
+            static unsigned long rxTick  = 0;
+            unsigned long now = (unsigned long)TickCount();
+            if (gDBSilence != prevSil) {
+                prevSil = gDBSilence;
+                gStarveUntil = now + 120;            /* ~2 s of "Buffering..." */
+            }
+            if (gRxTotal != prevRx) {
+                prevRx = gRxTotal;
+                rxTick = now;
+                gMountDry = 0;
+            } else if (gStream && now - rxTick > 180) {
+                gMountDry = 1;
+            }
+        }
         /* Latency trim (b31): backlog beyond target+slack means we fell
          * behind the live edge (menu freeze / dry-spell catch-up). Ask the
          * interrupt to skip the oldest PCM — one jump-cut back to ~target. */
@@ -1560,6 +1596,27 @@ static void ServiceAudio(void)
         DbgLog("audio: %s, %ld staged, %ld rx",
                gAuSt == AU_HTTP ? "awaiting header" : "syncing",
                (long)gCompLen, gRxTotal);
+    }
+}
+
+/* The engine narrating itself for the status row (b45). Empty = audio off. */
+static void AudioStatusStr(char *out, size_t cap)
+{
+    out[0] = '\0';
+    if (gAuSt == AU_IDLE) return;
+    if (gAuSt == AU_HTTP || gAuSt == AU_SYNC) {
+        snprintf(out, cap, "Tuning in...");
+    } else if (!gPlaying) {
+        long pct = (long)(((gRingWr - gRingRd) * 100) /
+                          (unsigned long)CQ_AUD_PREBUF_PCM);
+        if (pct > 99) pct = 99;
+        snprintf(out, cap, "Buffering... %ld%%", pct);
+    } else if (gMountDry) {
+        snprintf(out, cap, "Waiting for Spotify...");
+    } else if ((long)((unsigned long)TickCount() - gStarveUntil) < 0) {
+        snprintf(out, cap, "Buffering...");
+    } else {
+        snprintf(out, cap, "Listening");
     }
 }
 

@@ -167,6 +167,13 @@ with Retro68 and on the share, pending the UTM runtime pass.
   "Test Casquinha" drives launch→listen→search→add→next→wake→stop→quit with
   paced delays, and "Collect Logs" has the Finder copy every
   `Casquinha b*.log` onto the AFP share.
+- **Audio status readout (b45).** The engine narrates itself in the status
+  row (right-aligned, animated by the 2 Hz redraw): Tuning in… →
+  Buffering… N% (ring fill vs prebuffer — THE anti-re-click device; a
+  second Listen click is a Stop) → Listening, plus "Buffering…" on
+  starvation (gDBSilence moved within ~2 s) and "Waiting for Spotify…"
+  when rx parks >3 s while playing (dry mount: the right lever is
+  Play/Wake, not Listen).
 - **Auto-start (b43).** Opening the app is the user intent: auto-listen at
   launch (the engine's graceful dry-mount behavior makes sequencing free —
   it prebuffers until the wake opens the tap) + ONE wake decided off the
