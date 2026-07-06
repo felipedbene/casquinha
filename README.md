@@ -29,9 +29,13 @@ state entirely in the Toolbox:
   for accented names; graceful 429 backoff.
 - **Transport** — prev / play-pause / next, a volume slider, and a click-to-seek
   progress bar.
+- **Opens ready to play** — launching the app IS the intent: it tunes the
+  stream immediately and, off the first `/now` snapshot, fires ONE wake if
+  playback isn't already on the gopher-spot device. Zero clicks to música.
+  Hold **⌥ Option** at launch to start quiet.
 - **Wake** (⌘K, or the Wake button) — transfer playback onto the gopher-spot
   librespot device so the audio stream carries it, recovering the "playing on
-  another device" idle state.
+  another device" idle state (manual re-wake mid-session).
 - **Search & Queue** — built into the main window (search field + results list,
   live queue list); double-click a search hit to play it, or a queue row to
   jump straight to that track. Nothing playback-related lives in a menu: on a

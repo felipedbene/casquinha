@@ -167,6 +167,14 @@ with Retro68 and on the share, pending the UTM runtime pass.
   "Test Casquinha" drives launch→listen→search→add→next→wake→stop→quit with
   paced delays, and "Collect Logs" has the Finder copy every
   `Casquinha b*.log` onto the AFP share.
+- **Auto-start (b43).** Opening the app is the user intent: auto-listen at
+  launch (the engine's graceful dry-mount behavior makes sequencing free —
+  it prebuffers until the wake opens the tap) + ONE wake decided off the
+  first /now snapshot (skipped when already playing on the device;
+  deliberately steals playback from elsewhere — that's the ask). Single-shot
+  per launch, never re-fired mid-session — CLIENTS.md rule 10 ("wake only
+  after user intent") read honestly: the launch was the intent, once.
+  Hold OPTION at launch to start quiet.
 - **One-window UI (b30).** Menu tracking is a synchronous loop that starves
   the audio ring, so nothing you'd touch mid-listening lives in a menu
   anymore: search (field + results list), the queue list, Add to Queue, the

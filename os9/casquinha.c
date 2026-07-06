@@ -72,7 +72,7 @@ enum {
     kQuitItem    = 3     /* Preferences, -, Quit */
 };
 
-#define CQ_BUILD_TAG "b42"  /* bump on every VM-iteration build (see status row,
+#define CQ_BUILD_TAG "b43"  /* bump on every VM-iteration build (see status row,
                              * the share filenames, and the per-build log name) */
 #define CQ_DEFAULT_HOST "10.0.100.112"  /* server address is a pref (Fio 6) */
 #define CQ_DEFAULT_PORT 70
@@ -521,6 +521,14 @@ static int gAutoNexted = 0;   /* end-of-track watchdog: one auto-next per stop *
 static int  gNativePlay = 0;
 static char gFallbackUri[128] = "";
 
+/* Auto-start (b43): opening the app IS the intent to listen — tune the
+ * stream at launch and fire ONE wake off the first /now snapshot when
+ * playback isn't already on the gopher-spot device. Single-shot per launch
+ * (CLIENTS.md rule 10 read honestly: launch = user intent, once); holding
+ * the OPTION key at launch skips it all. */
+static int gAutoStart = 1;
+static int gAutoWoke  = 0;
+
 /* The row AFTER the current track in the visible queue — the client-side
  * "play from here onward" cursor (b40). Spotify cannot jump into a queue, so
  * jumps play bare URIs and the server queue is never consumed; the visible
@@ -644,6 +652,22 @@ static void AdoptReply(const unsigned char *d, size_t len, int isCmd)
             UpdatePlayTitle();
             if (gVol && !volHeld && gSnap.volume >= 0)
                 SetControlValue(gVol, gSnap.volume);
+            /* Auto-wake off the FIRST snapshot (b43): if playback isn't
+             * already on the gopher-spot device, transfer it here — the
+             * same command as the Wake button, once per launch, decided on
+             * real state instead of blindly. Stealing from another device
+             * is the point ("when I open the app I want to listen"). */
+            if (gAutoStart && !gAutoWoke) {
+                gAutoWoke = 1;
+                if (gSnap.state == CQ_STATE_PLAYING &&
+                    gSnap.device == CQ_DEV_ACTIVE) {
+                    DbgLog("auto: already playing on gopher-spot");
+                } else {
+                    DbgLog("auto: wake on launch (state=%d dev=%d)",
+                           (int)gSnap.state, (int)gSnap.device);
+                    StartCommand("/spot/api/1/wake?play=1");
+                }
+            }
         } else {
             cq_now_free(&tmp);
         }
@@ -1982,6 +2006,15 @@ int main(void)
     cq_cache_init(&gCovers);
     cq_debounce_init(&gDeb);
     LoadPrefs();                              /* server address from the prefs file */
+
+    {   /* hold OPTION at launch to start quiet (no auto listen/wake, b43) */
+        KeyMap km;
+        GetKeys(km);
+        if ((((unsigned char *)km)[0x3A >> 3] >> (0x3A & 7)) & 1) {
+            gAutoStart = 0;
+            DbgLog("auto: skipped (option held at launch)");
+        }
+    }
     memset(&gSnap, 0, sizeof(gSnap));
 
     InstallAEHandlers();                       /* scriptability (b36) */
@@ -1993,6 +2026,14 @@ int main(void)
         SetPort((GrafPtr)gWindow);
         MakeControls(gWindow);
         ShowWindow(gWindow);
+    }
+
+    if (gAutoStart && gAuSt == AU_IDLE) {
+        /* Tune in right away (b43). A dry mount is fine — the engine waits
+         * in its prebuffering state and starts by itself once the launch
+         * wake (fired off the first /now snapshot) opens the tap. */
+        DbgLog("auto: listen on launch");
+        ToggleListen();
     }
 
     while (gRunning) {
