@@ -72,7 +72,7 @@ enum {
     kQuitItem    = 3     /* Preferences, -, Quit */
 };
 
-#define CQ_BUILD_TAG "b41"  /* bump on every VM-iteration build (see status row,
+#define CQ_BUILD_TAG "b42"  /* bump on every VM-iteration build (see status row,
                              * the share filenames, and the per-build log name) */
 #define CQ_DEFAULT_HOST "10.0.100.112"  /* server address is a pref (Fio 6) */
 #define CQ_DEFAULT_PORT 70
@@ -109,15 +109,21 @@ static long          gLastLen   = 0;     /* bytes of last reply */
 static char          gLastMsg[128] = "";
 static unsigned long gLastDraw  = 0;
 
-/* --- debug log: appended next to the app as "Casquinha <tag>.log" (copy it
- * back onto the AFP share to read on the host), and MIRRORED live as one UDP
- * datagram per line to the dev Mac (b34 — remote-syslog pattern: `make
- * logtail` on the host tails it in real time; fire-and-forget, lost
- * datagrams cost nothing, and the file stays as the offline fallback).
- * Best-effort everywhere: a logger must never get in the way. */
-#define CQ_LOG_HOST "10.0.1.165"   /* the dev Mac's LAN address */
+/* --- debug log: OPT-IN via a marker file (b42). When a file named
+ * "Casquinha Debug" sits next to the app, every DbgLog line goes to
+ * "Casquinha <tag>.log" (flushed per line; copy back over the AFP share)
+ * AND is mirrored live as one UDP datagram to the dev machine (b34 —
+ * remote-syslog pattern: `make logtail` tails it in real time). The
+ * marker's first line may override the mirror target as "host:port".
+ * NO MARKER = NO TELEMETRY: no log file, no datagrams — a clean build for
+ * anyone else's Mac. Best-effort everywhere: a logger must never get in
+ * the way. */
+#define CQ_LOG_HOST "10.0.1.165"   /* default mirror target (dev Mac) */
 #define CQ_LOG_PORT 5514
-static short gLogRef = 0;    /* 0 = not open yet */
+static short gLogRef  = 0;   /* 0 = not open yet */
+static int   gLogMode = 0;   /* 0 = marker unchecked, -1 = off, 1 = on */
+static char  gLogHost[64] = CQ_LOG_HOST;
+static int   gLogPort     = CQ_LOG_PORT;
 
 static void DbgLog(const char *fmt, ...)
 {
@@ -127,6 +133,41 @@ static void DbgLog(const char *fmt, ...)
     unsigned long t;
     va_list       ap;
 
+    if (gLogMode < 0) return;                            /* telemetry is OFF */
+    if (gLogMode == 0) {
+        /* first call: does the "Casquinha Debug" marker exist? */
+        FSSpec msp;
+        if (FSMakeFSSpec(0, 0, "\pCasquinha Debug", &msp) != noErr) {
+            gLogMode = -1;                               /* no marker: stay silent */
+            return;
+        }
+        {   /* optional first line = "host:port" mirror override */
+            short mref;
+            if (FSpOpenDF(&msp, fsRdPerm, &mref) == noErr) {
+                char mb[64];
+                long mc = sizeof(mb) - 1;
+                FSRead(mref, &mc, mb);                   /* eofErr still fills mc */
+                FSClose(mref);
+                if (mc > 0) {
+                    char *e, *colon;
+                    mb[mc] = '\0';
+                    for (e = mb; *e && *e != '\r' && *e != '\n'; e++) {}
+                    *e = '\0';
+                    colon = strchr(mb, ':');
+                    if (colon) {
+                        int p = atoi(colon + 1);
+                        *colon = '\0';
+                        if (p > 0 && p < 65536) gLogPort = p;
+                    }
+                    if (mb[0]) {
+                        strncpy(gLogHost, mb, sizeof(gLogHost) - 1);
+                        gLogHost[sizeof(gLogHost) - 1] = '\0';
+                    }
+                }
+            }
+        }
+        gLogMode = 1;
+    }
     if (!gLogRef) {
         FSSpec sp;
         OSErr  e;
@@ -153,7 +194,7 @@ static void DbgLog(const char *fmt, ...)
     FSWrite(gLogRef, &cnt, buf);
     FlushVol(NULL, 0);        /* commit now — the tail must survive a freeze */
     buf[n - 1] = '\n';        /* unix ending for the live tail */
-    cq_tx_udp(CQ_LOG_HOST, CQ_LOG_PORT, buf, (size_t)n);
+    cq_tx_udp(gLogHost, gLogPort, buf, (size_t)n);
 }
 
 /* --- transport controls (Fio 4) --- */

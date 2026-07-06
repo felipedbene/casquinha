@@ -57,14 +57,41 @@ checks green**, including decoding a captured slice of the real stream). The
 app is classic PowerPC + Open Transport + the Toolbox, cross-built with
 Retro68 and run in **UTM** (QEMU/PPC).
 
-Exercised on the VM: Now Playing, transport, search, queue (incl. add + jump),
-covers, preferences, and **⌘T audio** (b21: sustained playback, zero
-underruns). **Open items:** confirming the new **wake** command and the full
-**Fios A–H** runtime pass on real/emulated hardware.
+Exercised on the VM (through b42): Now Playing, transport, search, queue
+(add + jump with **native play-from contexts** via gopher-spot's
+`/spot/api/1/play/from`, spec'd from this repo in
+[`design/SPEC-play-from.md`](design/SPEC-play-from.md)), covers, preferences,
+**wake**, and **⌘T audio** (sustained playback, zero underruns, ~3 s radio
+latency with graceful starvation). **Open item:** the full **Fios A–H**
+runtime pass on real hardware.
 
 See [`NOTES.md`](NOTES.md) for the fio-by-fio arc + permanent constraints, and
 [`design/PATTERN-MAP-os9.md`](design/PATTERN-MAP-os9.md) for the DeGelato →
 Mac OS 9.2 mapping.
+
+## Debugging & telemetry (opt-in)
+
+The app is silent by default — **no log files, no network telemetry**. To
+turn the debug harness on, put a file named **`Casquinha Debug`** in the same
+folder as the app (an empty SimpleText file is enough). With the marker
+present:
+
+- every event is appended to **`Casquinha <tag>.log`** next to the app (one
+  log per build, flushed per line so it survives a freeze), and
+- each line is **mirrored live as a UDP datagram** to the dev machine —
+  run `make logtail` on the host (a tiny Python listener; macOS `nc -kul`
+  latches onto the first sender and drops the rest) and watch the VM narrate
+  itself in real time. The marker file's first line can override the mirror
+  target as `host:port`.
+
+Delete the marker and the app goes quiet again. Extras in `tools/`:
+`mp3scan.c` (mount forensics: frame gaps/format flips in a captured stream),
+and two AppleScripts — `Test Casquinha` (an ordered smoke test driven over
+Apple Events: the app answers `quit` and a `do script` command string) and
+`Collect Logs` (Finder copies every per-build log onto the AFP share).
+`make app` drops **versioned** binaries (`Casquinha-<tag>.bin/.dsk`) on the
+share alongside the unversioned latest, and the build tag is visible in the
+status row — no more guessing which binary is running over there.
 
 ## Building
 

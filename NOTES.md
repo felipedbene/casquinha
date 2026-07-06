@@ -182,11 +182,17 @@ with Retro68 and on the share, pending the UTM runtime pass.
   `MaxApplZone`. Steady state on the VM: ~3.8 bufs/s (= 1.0 s audio/s),
   4 in flight, zero underruns; the mount starves briefly between tracks
   (librespot feeds Icecast only while playing) and the engine rides it out.
-  Debug harness: `DbgLog` → `Casquinha <tag>.log` next to the app (one log
-  PER BUILD, b32 — a session can't be misread against the wrong binary),
-  flushed per line, round-tripped over the AFP share. The share drops are
-  versioned too: `make app` copies `Casquinha-<tag>.bin/.dsk` alongside the
-  unversioned latest.
+  Debug harness: **opt-in via a marker file** (b42) — telemetry runs ONLY
+  when "Casquinha Debug" sits next to the app; without it, no log file and
+  no datagrams (clean build for any other Mac). With it: `DbgLog` →
+  `Casquinha <tag>.log` (one log PER BUILD, b32; flushed per line) AND a
+  live UDP mirror to the dev machine (b34/b38 — remote-syslog; `make
+  logtail`, which is tools/loglisten.py because macOS `nc -kul` latches
+  onto the first sender; T_UDERR must be cleared or one ICMP unreachable
+  kills every later send; health counters in the heartbeat). The marker's
+  first line may override the mirror target as `host:port`. Share drops
+  are versioned: `make app` copies `Casquinha-<tag>.bin/.dsk` alongside
+  the unversioned latest.
 - **Fio A (exhaustion audit, b8) — cover fail-once + tried-set.** New pure
   module `cq_cache` (fixed-slot FIFO, NULL value = "tried, no image"): every
   /cover outcome is remembered, so a failing fetch is no longer retried every
