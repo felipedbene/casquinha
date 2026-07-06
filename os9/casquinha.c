@@ -72,7 +72,7 @@ enum {
     kQuitItem    = 3     /* Preferences, -, Quit */
 };
 
-#define CQ_BUILD_TAG "b47"  /* bump on every VM-iteration build (see status row,
+#define CQ_BUILD_TAG "b48"  /* bump on every VM-iteration build (see status row,
                              * the share filenames, and the per-build log name) */
 #define CQ_DEFAULT_HOST "10.0.100.112"  /* server address is a pref (Fio 6) */
 #define CQ_DEFAULT_PORT 70
@@ -431,12 +431,23 @@ static void DrawWindowContents(WindowRef win)
     ThemeText(kThemeTextColorDialogActive);
     /* CQ_BUILD_TAG: bumped per VM-iteration build so it's provable WHICH binary
      * is running over there (stale copies on the netatalk share bite). */
-    snprintf(line, sizeof(line), "%s      %s      [%s]",
-             gSnap.state == CQ_STATE_PLAYING ? "Playing" :
-             gSnap.state == CQ_STATE_PAUSED  ? "Paused"  : "Stopped",
-             gSnap.device == CQ_DEV_ACTIVE ? "on gopher-spot" :
-             gSnap.device == CQ_DEV_IDLE   ? "playing elsewhere" : "",
-             CQ_BUILD_TAG);
+    {   /* state word — or the transient command ack ("Skipping...", b48):
+         * a click must visibly land NOW, not after the poll+radio latency */
+        const char *stateWord;
+        if (gTransMsg[0] &&
+            (long)((unsigned long)TickCount() - gTransUntil) < 0) {
+            stateWord = gTransMsg;
+        } else {
+            gTransMsg[0] = '\0';
+            stateWord = gSnap.state == CQ_STATE_PLAYING ? "Playing" :
+                        gSnap.state == CQ_STATE_PAUSED  ? "Paused"  : "Stopped";
+        }
+        snprintf(line, sizeof(line), "%s      %s      [%s]",
+                 stateWord,
+                 gSnap.device == CQ_DEV_ACTIVE ? "on gopher-spot" :
+                 gSnap.device == CQ_DEV_IDLE   ? "playing elsewhere" : "",
+                 CQ_BUILD_TAG);
+    }
     DrawCStr(16, 202, line);
 
     {   /* the audio engine narrating itself, right-aligned on the same row;
@@ -544,6 +555,13 @@ static int gAutoStart = 1;
 static int gAutoWoke  = 0;
 static int gAutoPlayPending = 0;   /* stopped-at-launch: play the queue head
                                       once the first /queue snapshot lands */
+
+/* Transient command acknowledgment (b48): clicking Next gave no visible
+ * reaction for up to ~7 s (debounce + poll flip + radio latency), so users
+ * doubted the click landed. Shown in place of the state word until the
+ * track actually changes (or an 8 s timeout). */
+static char          gTransMsg[24] = "";
+static unsigned long gTransUntil = 0;
 
 /* The row AFTER the current track in the visible queue — the client-side
  * "play from here onward" cursor (b40). Spotify cannot jump into a queue, so
@@ -659,6 +677,7 @@ static void AdoptReply(const unsigned char *d, size_t len, int isCmd)
             if (tmp.track_id && (!gSnap.track_id ||
                                  strcmp(tmp.track_id, gSnap.track_id) != 0)) {
                 gQueueKick = (unsigned long)TickCount() + 120;
+                gTransMsg[0] = '\0';           /* the skip landed (b48) */
                 /* the UI-flip moment, timestamped: ear-vs-UI staleness at
                  * natural transitions is measurable from the log sink (b44) */
                 DbgLog("now: %s - %s",
@@ -863,6 +882,8 @@ static void ToggleListen(void);
  * is playing and the visible queue has a head, play that head directly. */
 static void NextCommand(void)
 {
+    snprintf(gTransMsg, sizeof(gTransMsg), "Skipping...");   /* click landed (b48) */
+    gTransUntil = (unsigned long)TickCount() + 480;
     if (gSnap.state != CQ_STATE_PLAYING) {
         int row = QueueNextRow();
         if (row >= 0) {
@@ -932,6 +953,8 @@ static void DoContentClick(WindowRef win, Point where)
         }
         if (TrackControl(ctl, where, NULL)) {
             if (ctl == gPrev) {              /* debounced (law 1) */
+                snprintf(gTransMsg, sizeof(gTransMsg), "Skipping...");
+                gTransUntil = (unsigned long)TickCount() + 480;
                 cq_debounce_set(&gDeb, "/spot/api/1/prev");
                 gCmdFire = (unsigned long)TickCount() + CQ_DEBOUNCE_TICKS;
             } else if (ctl == gNext) {
@@ -1611,18 +1634,20 @@ static void AudioStatusStr(char *out, size_t cap)
     out[0] = '\0';
     if (gAuSt == AU_IDLE) return;
     if (gAuSt == AU_HTTP || gAuSt == AU_SYNC) {
-        snprintf(out, cap, "Tuning in...");
+        snprintf(out, cap, "tuning in...");
     } else if (!gPlaying) {
         long pct = (long)(((gRingWr - gRingRd) * 100) /
                           (unsigned long)CQ_AUD_PREBUF_PCM);
         if (pct > 99) pct = 99;
-        snprintf(out, cap, "Buffering... %ld%%", pct);
+        snprintf(out, cap, "buffering... %ld%%", pct);
     } else if (gMountDry) {
-        snprintf(out, cap, "Waiting for Spotify...");
+        snprintf(out, cap, "waiting for Spotify...");
     } else if ((long)((unsigned long)TickCount() - gStarveUntil) < 0) {
-        snprintf(out, cap, "Buffering...");
+        snprintf(out, cap, "buffering...");
     } else {
-        snprintf(out, cap, "Listening");
+        /* radio vocabulary, lowercase — "Listening" read like the retired
+         * Listen toggle (b48 field report); "on air" is unmistakably status */
+        snprintf(out, cap, "on air");
     }
 }
 

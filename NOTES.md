@@ -167,6 +167,12 @@ with Retro68 and on the share, pending the UTM runtime pass.
   "Test Casquinha" drives launch→listen→search→add→next→wake→stop→quit with
   paced delays, and "Collect Logs" has the Finder copy every
   `Casquinha b*.log` onto the AFP share.
+- **Command ack + radio vocabulary (b48).** Clicking Next showed nothing
+  for up to ~7 s (debounce + poll flip + radio latency) — now "Skipping..."
+  replaces the state word the instant the click lands, cleared when the
+  track_id actually flips (or 8 s timeout). And the audio status went
+  lowercase-radio ("on air" instead of "Listening", which read like the
+  b46-retired toggle).
 - **Auto-start matrix (b47).** The single launch wake hiccupped in the
   field: `wake?play=1` on a PAUSED-but-active device does NOT resume
   (transfer-to-self no-op; the user sat in silence 17 s and pressed Next).
