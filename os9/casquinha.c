@@ -115,6 +115,13 @@ static unsigned long gLastDraw  = 0;
  * re-click (and a second Listen click is a Stop). */
 static void AudioStatusStr(char *out, size_t cap);
 
+/* Transient command acknowledgment (b48): clicking Next gave no visible
+ * reaction for up to ~7 s (debounce + poll flip + radio latency), so users
+ * doubted the click landed. Shown in place of the state word until the
+ * track actually changes (or an 8 s timeout). */
+static char          gTransMsg[24] = "";
+static unsigned long gTransUntil = 0;
+
 /* --- debug log: OPT-IN via a marker file (b42). When a file named
  * "Casquinha Debug" sits next to the app, every DbgLog line goes to
  * "Casquinha <tag>.log" (flushed per line; copy back over the AFP share)
@@ -556,12 +563,6 @@ static int gAutoWoke  = 0;
 static int gAutoPlayPending = 0;   /* stopped-at-launch: play the queue head
                                       once the first /queue snapshot lands */
 
-/* Transient command acknowledgment (b48): clicking Next gave no visible
- * reaction for up to ~7 s (debounce + poll flip + radio latency), so users
- * doubted the click landed. Shown in place of the state word until the
- * track actually changes (or an 8 s timeout). */
-static char          gTransMsg[24] = "";
-static unsigned long gTransUntil = 0;
 
 /* The row AFTER the current track in the visible queue — the client-side
  * "play from here onward" cursor (b40). Spotify cannot jump into a queue, so
