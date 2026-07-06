@@ -167,6 +167,10 @@ with Retro68 and on the share, pending the UTM runtime pass.
   "Test Casquinha" drives launch→listen→search→add→next→wake→stop→quit with
   paced delays, and "Collect Logs" has the Finder copy every
   `Casquinha b*.log` onto the AFP share.
+- **Button retirement (b46).** Auto-start (b43) + the status readout (b45)
+  made the Listen/Stop and Wake buttons ceremonial — removed; ⌘T/⌘K and
+  the AppleScript commands are the manual levers. The shelf is one row
+  (field + Search + Add to Queue) and the lists got the reclaimed 28 px.
 - **Audio status readout (b45).** The engine narrates itself in the status
   row (right-aligned, animated by the 2 Hz redraw): Tuning in… →
   Buffering… N% (ring fill vs prebuffer — THE anti-re-click device; a

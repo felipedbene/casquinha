@@ -72,7 +72,7 @@ enum {
     kQuitItem    = 3     /* Preferences, -, Quit */
 };
 
-#define CQ_BUILD_TAG "b45"  /* bump on every VM-iteration build (see status row,
+#define CQ_BUILD_TAG "b46"  /* bump on every VM-iteration build (see status row,
                              * the share filenames, and the per-build log name) */
 #define CQ_DEFAULT_HOST "10.0.100.112"  /* server address is a pref (Fio 6) */
 #define CQ_DEFAULT_PORT 70
@@ -253,16 +253,17 @@ static int           gQueueEmptyRuns = 0;   /* consecutive empty /queue replies 
  * won out (tradeoff: the track may replay later — it isn't removed from queue). */
 static ControlHandle gSearchBtn = NULL;
 static ControlHandle gQueueAddBtn = NULL;   /* "Add to Queue" on the selected search row */
-static ControlHandle gListenBtn = NULL;     /* Listen <-> Stop toggle (b30) */
-static ControlHandle gWakeBtn = NULL;       /* transfer playback to gopher-spot */
+/* No Listen/Wake buttons since b46: auto-start (b43) made them ceremonial —
+ * the app tunes and wakes itself at launch. ⌘T/⌘K and the AppleScript
+ * commands remain as the manual levers. */
 
 /* Shelf geometry (b30): the player area above CQ_SHELF_TOP is redrawn by the
  * 2 Hz animator; everything below is controls + List Manager territory and
  * only repaints on real update events (or the animator would wipe it). */
 #define CQ_SHELF_TOP    232
-#define CQ_LIST_TOP     310
+#define CQ_LIST_TOP     282   /* b46: the dead button row went to the lists */
 #define CQ_LIST_BOTTOM  474
-#define CQ_LABEL_Y      304   /* breathing room above the -1-inset list frames */
+#define CQ_LABEL_Y      276   /* breathing room above the -1-inset list frames */
 
 /* -------------------------------------------------------------------------- */
 
@@ -876,19 +877,16 @@ static void MakeControls(WindowRef win)
     SetRect(&r, 300, 160, W - 16, 176);
     gVol = NewControl(win, &r, "\p", true, 50, 0, 100, kControlSliderProc, 0);
 
-    /* --- the shelf (b30): search + queue + audio controls, always visible.
-     * Menu tracking freezes the cooperative loop (and thus starves the audio
-     * ring), so everything you'd touch mid-listening lives HERE. */
-    SetRect(&r, 16, 240, W - 88, 262);
+    /* --- the shelf (b30/b46): search + queue, always visible. Menu tracking
+     * freezes the cooperative loop (and thus starves the audio ring), so
+     * everything you'd touch mid-listening lives HERE. One row: field +
+     * Search + Add to Queue (Listen/Wake became automatic in b43). */
+    SetRect(&r, 16, 240, W - 206, 262);
     gSearchEdit = NewControl(win, &r, "\p", true, 0, 0, 0, kControlEditTextProc, 0);
-    SetRect(&r, W - 80, 238, W - 16, 260);
+    SetRect(&r, W - 198, 238, W - 134, 260);
     gSearchBtn = NewControl(win, &r, "\pSearch", true, 0, 0, 0, pushButProc, 0);
-    SetRect(&r, 16, 268, 126, 288);
+    SetRect(&r, W - 126, 238, W - 16, 260);
     gQueueAddBtn = NewControl(win, &r, "\pAdd to Queue", true, 0, 0, 0, pushButProc, 0);
-    SetRect(&r, 134, 268, 214, 288);
-    gListenBtn = NewControl(win, &r, "\pListen", true, 0, 0, 0, pushButProc, 0);
-    SetRect(&r, 222, 268, 302, 288);
-    gWakeBtn = NewControl(win, &r, "\pWake", true, 0, 0, 0, pushButProc, 0);
 
     SetRect(&r, 16, CQ_LIST_TOP, W / 2 - 6, CQ_LIST_BOTTOM);
     gSearchList = MakeList(win, &r);
@@ -934,13 +932,6 @@ static void DoContentClick(WindowRef win, Point where)
                 RunSearch();
             } else if (ctl == gQueueAddBtn) {
                 QueueSelected();
-            } else if (ctl == gListenBtn) {  /* toggle; title tracks the state */
-                ToggleListen();
-            } else if (ctl == gWakeBtn) {
-                /* Transfer playback onto the librespot device (+ resume) so
-                 * the audio stream carries it. wake returns a /now-shaped
-                 * reply, so it goes through StartCommand/AdoptReply. */
-                StartCommand("/spot/api/1/wake?play=1");
             }
         }
         return;
@@ -1313,7 +1304,6 @@ static void StopAudio(const char *why)
     gRingSkip = 0;
     gStarveUntil = 0;
     gMountDry = 0;
-    if (gListenBtn) SetControlTitle(gListenBtn, "\pListen");   /* toggle shows state */
 }
 
 /* First confirmed frame in hand: reset the decoder and arm the ring. The
@@ -1642,7 +1632,9 @@ static void StartStream(const char *url)
     DbgLog("audio: streaming GET %s:%d%s", host, port, path);
 }
 
-/* Listen / Stop toggle (the gListenBtn title mirrors the state, b30). */
+/* Listen / Stop toggle — ⌘T and the AppleScript "listen"/"stop" commands;
+ * the button retired in b46 (auto-start made it ceremonial), and the status
+ * readout (b45) is the visible state. */
 static void ToggleListen(void)
 {
     if (gAuSt != AU_IDLE) { StopAudio("user toggle"); return; }
@@ -1650,7 +1642,6 @@ static void ToggleListen(void)
     gPls = cq_tx_new(gHost, gPort, "/spot/stream.pls");   /* discover the stream URL */
     if (gPls) {
         cq_tx_start(gPls);
-        if (gListenBtn) SetControlTitle(gListenBtn, "\pStop");
         DbgLog("audio: fetching /spot/stream.pls from %s:%d", gHost, gPort);
     } else {
         DbgLog("audio: pls tx alloc failed");
@@ -1694,9 +1685,6 @@ static void PumpAux(void)
                    (int)cq_tx_error_code(gPls), cq_tx_error_message(gPls));
             cq_tx_free(gPls); gPls = NULL;
         }
-        /* Discovery over but no stream? The toggle button lied — reset it. */
-        if (!gPls && gAuSt == AU_IDLE && gListenBtn)
-            SetControlTitle(gListenBtn, "\pListen");
     }
 
     if (gSearchTx) {

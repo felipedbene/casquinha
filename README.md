@@ -33,16 +33,17 @@ state entirely in the Toolbox:
   stream immediately and, off the first `/now` snapshot, fires ONE wake if
   playback isn't already on the gopher-spot device. Zero clicks to música.
   Hold **⌥ Option** at launch to start quiet.
-- **Wake** (⌘K, or the Wake button) — transfer playback onto the gopher-spot
-  librespot device so the audio stream carries it, recovering the "playing on
-  another device" idle state (manual re-wake mid-session).
+- **Wake** (⌘K) — transfer playback onto the gopher-spot librespot device so
+  the audio stream carries it, recovering the "playing on another device"
+  idle state (manual re-wake mid-session; the launch wake is automatic, and
+  the buttons retired in b46 — the app runs itself).
 - **Search & Queue** — built into the main window (search field + results list,
   live queue list); double-click a search hit to play it, or a queue row to
   jump straight to that track. Nothing playback-related lives in a menu: on a
   cooperative OS, menu tracking freezes the app — and the audio with it.
 - **Cover art** — QuickTime GraphicsImporter, behind a fail-once cover cache.
 - **Preferences** (⌘,) — the server address, saved to disk.
-- **Audio** (⌘T, or the Listen⇄Stop toggle) — with a live status readout in
+- **Audio** (automatic; ⌘T toggles manually) — with a live status readout in
   the player ("Tuning in… / Buffering… N% / Waiting for Spotify… /
   Listening") so the silent phases read as progress, not breakage. The
   stream is the live Icecast MP3, decoded **in-app by minimp3**
