@@ -90,6 +90,9 @@ app:
 	cd os9/build && PATH="$(RETRO68)/bin:$$PATH" $(MAKE)
 	@echo "built: os9/build/Casquinha.bin (MacBinary PPC app), .dsk (disk image)"
 	@if [ -n "$(SHARE)" ] && [ -d "$(SHARE)" ]; then \
-	  cp os9/build/Casquinha.bin os9/build/Casquinha.dsk "$(SHARE)/" 2>/dev/null || true; \
-	  echo "dropped Casquinha.bin + .dsk on $(SHARE)"; \
+	  rm -f "$(SHARE)/Casquinha.bin" "$(SHARE)/Casquinha.dsk"; \
+	  cp -X os9/build/Casquinha.bin os9/build/Casquinha.dsk "$(SHARE)/"; \
+	  echo "dropped Casquinha.bin + .dsk on $(SHARE) (sha1 $$(shasum -a1 os9/build/Casquinha.bin | cut -c1-12))"; \
+	else \
+	  echo "SHARE not found ($(SHARE)) -- .bin NOT copied"; \
 	fi

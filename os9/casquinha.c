@@ -61,11 +61,12 @@ enum {
     kSearchItem  = 1,    /* File menu */
     kQueueItem   = 2,
     kListenItem  = 3,
-    kPrefsItem   = 5,    /* Search, Queue, Listen, -, Preferences, -, Quit */
-    kQuitItem    = 7
+    kWakeItem    = 4,
+    kPrefsItem   = 6,    /* Search, Queue, Listen, Wake, -, Preferences, -, Quit */
+    kQuitItem    = 8
 };
 
-#define CQ_BUILD_TAG "b9"  /* bump on every VM-iteration build (see status row) */
+#define CQ_BUILD_TAG "b12"  /* bump on every VM-iteration build (see status row) */
 #define CQ_DEFAULT_HOST "10.0.100.112"  /* server address is a pref (Fio 6) */
 #define CQ_DEFAULT_PORT 70
 #define CQ_POLL_TICKS 120           /* 2 s at 60 ticks/sec (law 5: >= micro-cache) */
@@ -139,12 +140,10 @@ static unsigned long gQueueLast = 0;        /* last /queue fetch (ticks) */
 #define CQ_QUEUE_POLL_TICKS 300             /* re-fetch every 5 s while the window is open */
 static cq_backoff    gQBackoff;             /* queue re-fetch cadence, backs off on errors (Fio D) */
 static unsigned long gQueueKick = 0;        /* one-shot /queue refetch due at this tick (Fio H); 0 = none */
-/* Double-click row i in the queue = skip forward i+1 times: the Web API has no
- * "jump to queue position" (nor reorder/remove — the queue is append-only), so
- * the jump is expressed as chained /next commands, fired one at a time. */
-static short gSkipsPending = 0;
-static unsigned long gSkipFire = 0;         /* earliest tick for the next chained /next (Fio D) */
-#define CQ_SKIP_GAP_TICKS 30                /* ~0.5 s between chained /next hops */
+/* Double-click a queue row = play that track directly with one /spot/play?uri=
+ * (see AuxClick). The Web API has no jump-to-queue-index; chaining /next per row
+ * was N rate-limited player calls and a visible FFwd, so one-call direct play
+ * won out (tradeoff: the track may replay later — it isn't removed from queue). */
 static ControlHandle gSearchBtn = NULL;
 static ControlHandle gQueueAddBtn = NULL;   /* "Add to Queue" on the selected search row */
 
@@ -808,17 +807,14 @@ static void AuxClick(WindowRef win, Point where)
         Cell c;
         SetPt(&c, 0, 0);
         if (LGetSelect(true, &c, list)) {
-            if (win == gQueueWin) {
-                /* Jump WITHIN the queue: skip forward to the row, consuming it
-                 * on the way (play?uri= here would leave a duplicate behind).
-                 * Ignored while a previous jump is still draining. */
-                if (gSkipsPending == 0 && c.v >= 0 && (size_t)c.v < items->count) {
-                    gSkipsPending = (short)(c.v + 1);
-                    StartFire("/spot/api/1/next");
-                }
-            } else {
-                PlayItem(items, c.v);
-            }
+            /* Both windows jump straight to the double-clicked track with ONE
+             * /spot/play?uri= (PlayItem). The queue used to chain N /next hops
+             * to consume the intervening rows and avoid a duplicate, but that's
+             * N calls to the rate-limited player endpoint and a visible FFwd
+             * per row; Spotify has no jump-to-queue-index, so one-call direct
+             * play is the cheap choice. Tradeoff: the chosen track may remain in
+             * up-next and replay later. */
+            PlayItem(items, c.v);
         }
     }
 }
@@ -908,24 +904,14 @@ static void PumpAux(void)
 {
     if (gFire && cq_tx_poll(gFire) != CQ_TX_RUNNING) {
         cq_tx_free(gFire); gFire = NULL;
-        if (gSkipsPending > 0) gSkipsPending--;
-        if (gSkipsPending > 0) {
-            /* Mid-jump: pace the chain ~0.5 s per hop (Fio D) — every /next is
-             * a Spotify call server-side; back-to-back hops read as a burst.
-             * The queue refresh holds until the whole jump has drained. */
-            gSkipFire = (unsigned long)TickCount() + CQ_SKIP_GAP_TICKS;
-        } else if (gQueueWin) {
-            /* A command (play / queue-add / end of a jump) just landed. The
-             * server is eventually consistent (~1-2 s), so schedule ONE
-             * refetch ~2 s out (Fio H, CLIENTS.md g13) instead of refetching
-             * instantly and usually missing the change. */
+        if (gQueueWin) {
+            /* A command (play / queue-add) just landed. The server is eventually
+             * consistent (~1-2 s), so schedule ONE refetch ~2 s out (Fio H,
+             * CLIENTS.md g13) instead of refetching instantly and usually
+             * missing the change. */
             gQueueKick = (unsigned long)TickCount() + 120;
         }
     }
-    /* Fire the next paced hop of a queue jump once its gap has passed. */
-    if (gSkipsPending > 0 && !gFire &&
-        (long)((unsigned long)TickCount() - gSkipFire) >= 0)
-        StartFire("/spot/api/1/next");
 
     ServiceAudio();                                       /* non-blocking audio service */
 
@@ -1068,6 +1054,12 @@ static void DoPrefs(void)
     char   pbuf[16];
 
     if (!d) return;
+    /* The DLOG resource is `invisible` (built hidden so we can populate the edit
+     * fields before it paints). It MUST be shown before ModalDialog — otherwise
+     * the modal loop runs on a hidden dialog whose Save/Cancel buttons can't be
+     * clicked, so it never sees item 1/2 and never returns: the whole machine
+     * appears frozen (cursor moves, nothing responds). */
+    ShowWindow(d);
 
     GetDialogItem(d, 3, &type, &h, &box);              /* host edit field */
     C2P(gHost, ps); SetDialogItemText(h, ps);
@@ -1128,6 +1120,11 @@ static void DoMenu(long choice)
             if (item == kSearchItem)      OpenSearch();
             else if (item == kQueueItem)  OpenQueue();
             else if (item == kListenItem) ToggleListen();
+            /* Transfer playback to the gopher-spot librespot device (?play=1 =
+             * resume on transfer) so the audio stream carries it. wake returns a
+             * /now snapshot, so StartCommand routes it through AdoptReply like
+             * the other transport commands. Recovers `device idle`. */
+            else if (item == kWakeItem)   StartCommand("/spot/api/1/wake?play=1");
             else if (item == kPrefsItem)  DoPrefs();
             else if (item == kQuitItem)   gRunning = false;
             break;

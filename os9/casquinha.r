@@ -70,13 +70,14 @@ resource 'MENU' (128) {
 resource 'MENU' (129, "File") {
     129, textMenuProc, allEnabled, enabled, "File",
     {
-        "Search...",      noicon, "F", nomark, plain;
-        "Queue",          noicon, "U", nomark, plain;
-        "Listen / Stop",  noicon, "T", nomark, plain;
-        "-",              noicon, nokey, nomark, plain;
-        "Preferences...", noicon, ",", nomark, plain;
-        "-",              noicon, nokey, nomark, plain;
-        "Quit",           noicon, "Q", nomark, plain
+        "Search...",       noicon, "F", nomark, plain;
+        "Queue",           noicon, "U", nomark, plain;
+        "Listen / Stop",   noicon, "T", nomark, plain;
+        "Wake gopher-spot",noicon, "K", nomark, plain;
+        "-",               noicon, nokey, nomark, plain;
+        "Preferences...",  noicon, ",", nomark, plain;
+        "-",               noicon, nokey, nomark, plain;
+        "Quit",            noicon, "Q", nomark, plain
     }
 };
 
