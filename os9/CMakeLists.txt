@@ -17,6 +17,8 @@ add_application(Casquinha
     ../src/cq_backoff.c
     ../src/cq_cache.c
     ../src/cq_pls.c
+    ../src/cq_mp3.c               # MP3 frame sync for the ⌘T audio wire (b16)
+    ../src/cq_mp3dec.c            # minimp3 decode seam (b21 — QT decodes nothing)
     ../src/cq_transport_ot.c      # Open Transport backend (guarded by CQ_OS9)
 )
 
@@ -35,7 +37,14 @@ target_link_libraries(Casquinha
     TextEncodingConverter  # UTF-8 -> MacRoman at the draw boundary
     TextCommon
     QuickTimeLib           # GraphicsImporter cover-art decode (Fio 5)
+    SoundLib               # SndChannel + SoundConverter (⌘T audio, b16)
 )
+
+# The MP3 decoder must OUTRUN realtime on an emulated PPC (38 frames/s at
+# 44.1 kHz); b25 showed it lagging. Full throttle for that one TU: -O3 and
+# fast-math (minimp3 is float-heavy, and QEMU's PPC FP helpers are pricey).
+set_source_files_properties(../src/cq_mp3dec.c PROPERTIES
+    COMPILE_OPTIONS "-O3;-ffast-math;-fno-math-errno")
 
 # Smallest possible app: drop unused functions.
 set_target_properties(Casquinha PROPERTIES COMPILE_OPTIONS -ffunction-sections)

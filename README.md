@@ -29,14 +29,20 @@ state entirely in the Toolbox:
   for accented names; graceful 429 backoff.
 - **Transport** — prev / play-pause / next, a volume slider, and a click-to-seek
   progress bar.
-- **Wake** (⌘K) — transfer playback onto the gopher-spot librespot device so the
-  audio stream carries it, recovering the "playing on another device" idle state.
-- **Search & Queue** (⌘F / ⌘U) — List Manager windows; double-click a search hit
-  to play it, or a queue row to jump straight to that track.
+- **Wake** (⌘K, or the Wake button) — transfer playback onto the gopher-spot
+  librespot device so the audio stream carries it, recovering the "playing on
+  another device" idle state.
+- **Search & Queue** — built into the main window (search field + results list,
+  live queue list); double-click a search hit to play it, or a queue row to
+  jump straight to that track. Nothing playback-related lives in a menu: on a
+  cooperative OS, menu tracking freezes the app — and the audio with it.
 - **Cover art** — QuickTime GraphicsImporter, behind a fail-once cover cache.
 - **Preferences** (⌘,) — the server address, saved to disk.
-- **Audio** (⌘T) — the live Icecast MP3 stream via QuickTime. Best-effort; MacAST
-  parked on the stream is the reliable fallback.
+- **Audio** (⌘T, or the Listen⇄Stop toggle) — the live Icecast MP3 stream, decoded **in-app by minimp3**
+  and played through the Sound Manager (double-buffered `SndChannel`).
+  QuickTime proved unable to open a length-less live stream on OS 9, so the
+  whole path — endless Open Transport read, MP3 frame sync, decode, output —
+  is the project's own code (see NOTES.md for the b13–b21 arc).
 
 Under all of it: **backend-exhaustion hardening + CLIENTS.md compliance** —
 orderly TCP release, suspend/resume, jittered backoff, an in-flight cap, UTF-8
@@ -46,14 +52,15 @@ after a change. See [`design/AUDIT-backend-exhaustion.md`](design/AUDIT-backend-
 ## Status
 
 The pure core (Codec / Model / Reconciler) is plain C99 with an offline suite
-that runs **on a modern Mac** — no Retro68, no emulator (`make test`, **156
-checks green**). The app is classic PowerPC + Open Transport + the Toolbox,
-cross-built with Retro68 and run in **UTM** (QEMU/PPC).
+that runs **on a modern Mac** — no Retro68, no emulator (`make test`, **203
+checks green**, including decoding a captured slice of the real stream). The
+app is classic PowerPC + Open Transport + the Toolbox, cross-built with
+Retro68 and run in **UTM** (QEMU/PPC).
 
 Exercised on the VM: Now Playing, transport, search, queue (incl. add + jump),
-covers, and preferences. **Open items:** confirming the new **wake** command,
-the **⌘T audio** path, and the full **Fios A–H** runtime pass on real/emulated
-hardware.
+covers, preferences, and **⌘T audio** (b21: sustained playback, zero
+underruns). **Open items:** confirming the new **wake** command and the full
+**Fios A–H** runtime pass on real/emulated hardware.
 
 See [`NOTES.md`](NOTES.md) for the fio-by-fio arc + permanent constraints, and
 [`design/PATTERN-MAP-os9.md`](design/PATTERN-MAP-os9.md) for the DeGelato →

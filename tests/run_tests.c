@@ -19,6 +19,8 @@ int main(void)
     guard_tests();
     debounce_tests();
     pls_tests();
+    mp3_tests();
+    mp3dec_tests();
     backoff_tests();
     cache_tests();
     transport_tests();

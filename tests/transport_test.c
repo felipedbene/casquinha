@@ -59,6 +59,40 @@ static void *serve_once(void *arg)
     return NULL;
 }
 
+/* Accept one connection, read the request line, then dribble STREAM_TOTAL
+ * bytes (value = offset & 0xFF) in small bursts with pauses — an Icecast
+ * mount in miniature — and close. */
+#define STREAM_TOTAL 60000
+static void *serve_stream(void *arg)
+{
+    server_ctx *s = (server_ctx *)arg;
+    int fd = accept(s->listen_fd, NULL, NULL);
+    char buf[256];
+    ssize_t n;
+    size_t i, off;
+    unsigned char chunk[4096];
+    if (fd < 0) return NULL;
+
+    n = recv(fd, buf, sizeof(buf) - 1, 0);
+    if (n > 0) {
+        buf[n] = '\0';
+        for (i = 0; i < (size_t)n && buf[i] != '\r' && buf[i] != '\n'; i++)
+            s->got_selector[i] = buf[i];
+        s->got_selector[i] = '\0';
+    }
+    for (off = 0; off < STREAM_TOTAL; ) {
+        size_t k, m = STREAM_TOTAL - off;
+        if (m > sizeof(chunk)) m = sizeof(chunk);
+        for (k = 0; k < m; k++) chunk[k] = (unsigned char)((off + k) & 0xFF);
+        if (send(fd, chunk, m, 0) <= 0) break;
+        off += m;
+        usleep(2000);   /* dribble: force many RUNNING polls between bytes */
+    }
+    close(fd);
+    close(s->listen_fd);
+    return NULL;
+}
+
 /* Bind 127.0.0.1:0, return the fd and the ephemeral port. */
 static int start_server(server_ctx *s)
 {
@@ -147,6 +181,51 @@ void transport_tests(void)
         st = drive(t);
         CHECK(st == CQ_TX_FAILED, "refused connection fails");
         CHECK(cq_tx_error_code(t) == CQ_TX_ERR_CONNECT, "error is CONNECT");
+        cq_tx_free(t);
+    }
+
+    /* streaming: dribbled chunks drain incrementally, in order, then DONE on
+     * the server's close — the ⌘T audio wire in miniature */
+    {
+        server_ctx s;
+        pthread_t th;
+        cq_transport *t;
+        unsigned char got[100000];
+        size_t gotlen = 0;
+        int i, sawRunningWithData = 0;
+        cq_tx_status st = CQ_TX_RUNNING;
+
+        CHECK(start_server(&s) == 0, "stream server bound");
+        pthread_create(&th, NULL, serve_stream, &s);
+
+        t = cq_tx_stream_new("127.0.0.1", s.port, "GET /spotify.mp3 HTTP/1.0\r\n");
+        cq_tx_start(t);
+        for (i = 0; i < 10000 && gotlen < sizeof(got); i++) {
+            st = cq_tx_poll(t);
+            {
+                size_t n = cq_tx_drain(t, got + gotlen, sizeof(got) - gotlen);
+                gotlen += n;
+                if (n && st == CQ_TX_RUNNING) sawRunningWithData = 1;
+            }
+            if (st != CQ_TX_RUNNING) {
+                /* final drain of anything buffered at close */
+                gotlen += cq_tx_drain(t, got + gotlen, sizeof(got) - gotlen);
+                break;
+            }
+            usleep(1000);
+        }
+        CHECK(st == CQ_TX_DONE, "stream ends DONE when the server closes");
+        CHECK(sawRunningWithData, "bytes were drained while still RUNNING");
+        CHECK(gotlen == STREAM_TOTAL, "every dribbled byte arrived");
+        {
+            size_t k, ok = 1;
+            for (k = 0; k < gotlen; k++)
+                if (got[k] != (unsigned char)(k & 0xFF)) { ok = 0; break; }
+            CHECK(ok, "bytes arrived in order, none lost to the drain");
+        }
+        pthread_join(th, NULL);
+        CHECK_STR(s.got_selector, "GET /spotify.mp3 HTTP/1.0",
+                  "stream server received the HTTP request line");
         cq_tx_free(t);
     }
 }

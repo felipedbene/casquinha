@@ -65,6 +65,7 @@ struct cq_transport {
     unsigned long  start_tick;
     unsigned long  connect_tick;
     int            cancelled;
+    int            streaming;   /* endless response: drain-driven, no watchdog */
 };
 
 /* One-time OT startup (single-threaded cooperative app, so a static flag is safe). */
@@ -246,7 +247,11 @@ static void pump_recv(cq_transport *t)
     unsigned char chunk[CQ_TX_READ_CHUNK];
     OTFlags flags;
     for (;;) {
-        OTResult r = OTRcv(t->ep, chunk, sizeof(chunk), &flags);
+        OTResult r;
+        /* Streaming backpressure: past the high-water mark, stop reading and
+         * let the TCP window hold the server; cq_tx_drain() reopens the tap. */
+        if (t->streaming && t->len >= CQ_TX_STREAM_HIWAT) return;
+        r = OTRcv(t->ep, chunk, sizeof(chunk), &flags);
         if (r > 0) {
             if (append(t, chunk, (size_t)r) < 0) { fail(t, CQ_TX_ERR_STREAM, "Out of memory reading from"); return; }
             continue;
@@ -318,13 +323,35 @@ cq_tx_status cq_tx_poll(cq_transport *t)
 
     if (t->status == CQ_TX_RUNNING) {
         /* connect must land within the connect deadline; the whole thing within
-         * the watchdog. Both are TickCount deltas — the loop is the only clock. */
+         * the watchdog. Both are TickCount deltas — the loop is the only clock.
+         * A STREAMING transaction is only bounded until it reaches the receive
+         * state: an endless response is the point, so from there the server's
+         * close (T_ORDREL/T_DISCONNECT) is the sole way out. */
         if (t->st == ST_CONNECTING && (now - t->connect_tick) > (unsigned long)DEADLINE_TICKS)
             return fail(t, CQ_TX_ERR_TIMEOUT, "Timed out connecting to");
-        if ((now - t->start_tick) > (unsigned long)WATCHDOG_TICKS)
+        if (!(t->streaming && t->st == ST_RECEIVING) &&
+            (now - t->start_tick) > (unsigned long)WATCHDOG_TICKS)
             return fail(t, CQ_TX_ERR_TIMEOUT, "Timed out talking to");
     }
     return t->status;
+}
+
+cq_transport *cq_tx_stream_new(const char *host, int port, const char *selector)
+{
+    cq_transport *t = cq_tx_new(host, port, selector);
+    if (t) t->streaming = 1;
+    return t;
+}
+
+size_t cq_tx_drain(cq_transport *t, unsigned char *dst, size_t cap)
+{
+    size_t n;
+    if (!t || !dst || cap == 0 || t->len == 0) return 0;
+    n = t->len < cap ? t->len : cap;
+    memcpy(dst, t->data, n);
+    t->len -= n;
+    if (t->len) memmove(t->data, t->data + n, t->len);
+    return n;
 }
 
 const unsigned char *cq_tx_data(const cq_transport *t, size_t *len)
@@ -360,6 +387,77 @@ void cq_tx_free(cq_transport *t)
     free(t->req);
     free(t->data);
     free(t);
+}
+
+/* One-shot UDP datagram (network log mirror). Lazy singleton endpoint; only
+ * fires once OT is ALREADY up (the transactions bring it up on first use) so
+ * a boot-time log line can never drag InitOpenTransport in before the
+ * Toolbox. Send errors (flow, unreachable) are silently dropped — it's a
+ * log, not a transaction. */
+static EndpointRef g_udp_ep = kOTInvalidEndpointRef;
+static int         g_udp_state = 0;          /* 0 untried, 1 up, -1 dead */
+static InetAddress g_udp_to;
+static char        g_udp_host[64] = "";
+static long        g_udp_ok = 0, g_udp_fail = 0, g_udp_lasterr = 0;
+
+void cq_tx_udp_stats(long *ok, long *fail, long *lastErr)
+{
+    if (ok)      *ok      = g_udp_ok;
+    if (fail)    *fail    = g_udp_fail;
+    if (lastErr) *lastErr = g_udp_lasterr;
+}
+
+void cq_tx_udp(const char *host, int port, const void *data, size_t len)
+{
+    TUnitData ud;
+
+    if (!host || !data || len == 0 || g_udp_state < 0) return;
+    if (!g_ot_up) return;                    /* transactions haven't inited OT yet */
+
+    if (g_udp_state == 0 || strcmp(g_udp_host, host) != 0) {
+        OSStatus err;
+        InetHost ip;
+        if (g_udp_ep == kOTInvalidEndpointRef) {
+            g_udp_ep = OTOpenEndpoint(OTCreateConfiguration(kUDPName), 0, NULL, &err);
+            if (err != kOTNoError || g_udp_ep == kOTInvalidEndpointRef) {
+                g_udp_ep = kOTInvalidEndpointRef;
+                g_udp_state = -1;
+                return;
+            }
+            OTSetSynchronous(g_udp_ep);
+            OTSetNonBlocking(g_udp_ep);
+            if (OTBind(g_udp_ep, NULL, NULL) != kOTNoError) {
+                OTCloseProvider(g_udp_ep);
+                g_udp_ep = kOTInvalidEndpointRef;
+                g_udp_state = -1;
+                return;
+            }
+        }
+        if (!resolve_host(host, &ip)) { g_udp_state = -1; return; }
+        OTInitInetAddress(&g_udp_to, (InetPort)port, ip);
+        strncpy(g_udp_host, host, sizeof(g_udp_host) - 1);
+        g_udp_host[sizeof(g_udp_host) - 1] = '\0';
+        g_udp_state = 1;
+    }
+
+    OTMemzero(&ud, sizeof(ud));
+    ud.addr.buf  = (UInt8 *)&g_udp_to;
+    ud.addr.len  = sizeof(g_udp_to);
+    ud.udata.buf = (UInt8 *)data;
+    ud.udata.len = (ByteCount)len;
+    {
+        OTResult r = OTSndUData(g_udp_ep, &ud);
+        if (r == kOTLookErr) {
+            /* The OT UDP trap: one ICMP port-unreachable (listener not up
+             * yet) queues a T_UDERR on the endpoint and EVERY later send
+             * fails with kOTLookErr until it is cleared — the "exactly one
+             * datagram ever arrives" symptom. Clear and retry once. */
+            if (OTLook(g_udp_ep) == T_UDERR) OTRcvUDErr(g_udp_ep, NULL);
+            r = OTSndUData(g_udp_ep, &ud);
+        }
+        if (r == kOTNoError) g_udp_ok++;
+        else { g_udp_fail++; g_udp_lasterr = (long)r; }
+    }
 }
 
 #endif /* CQ_OS9 */

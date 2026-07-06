@@ -29,6 +29,7 @@
 #include <TextCommon.h>
 #include <TextEncodingConverter.h>
 #include <Movies.h>
+#include <Sound.h>
 #include <ImageCompression.h>
 #include <QDOffscreen.h>
 #include <Components.h>
@@ -36,9 +37,14 @@
 #include <Files.h>
 #include <Lists.h>
 
+#include <Gestalt.h>
+#include <AppleEvents.h>
+#include <AERegistry.h>
+
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 
 #include "cq_codec.h"
 #include "cq_now.h"
@@ -48,6 +54,8 @@
 #include "cq_debounce.h"
 #include "cq_track.h"
 #include "cq_pls.h"
+#include "cq_mp3.h"
+#include "cq_mp3dec.h"
 #include "cq_transport.h"
 
 enum {
@@ -58,15 +66,14 @@ enum {
     kMainWindow  = 128,
     kPrefsDialog = 129,
     kAboutItem   = 1,
-    kSearchItem  = 1,    /* File menu */
-    kQueueItem   = 2,
-    kListenItem  = 3,
-    kWakeItem    = 4,
-    kPrefsItem   = 6,    /* Search, Queue, Listen, Wake, -, Preferences, -, Quit */
-    kQuitItem    = 8
+    kPrefsItem   = 1,    /* File menu (b30): everything playback-related moved
+                          * INTO the main window — menu tracking freezes the
+                          * cooperative loop and starved the audio ring */
+    kQuitItem    = 3     /* Preferences, -, Quit */
 };
 
-#define CQ_BUILD_TAG "b12"  /* bump on every VM-iteration build (see status row) */
+#define CQ_BUILD_TAG "b41"  /* bump on every VM-iteration build (see status row,
+                             * the share filenames, and the per-build log name) */
 #define CQ_DEFAULT_HOST "10.0.100.112"  /* server address is a pref (Fio 6) */
 #define CQ_DEFAULT_PORT 70
 #define CQ_POLL_TICKS 120           /* 2 s at 60 ticks/sec (law 5: >= micro-cache) */
@@ -102,6 +109,53 @@ static long          gLastLen   = 0;     /* bytes of last reply */
 static char          gLastMsg[128] = "";
 static unsigned long gLastDraw  = 0;
 
+/* --- debug log: appended next to the app as "Casquinha <tag>.log" (copy it
+ * back onto the AFP share to read on the host), and MIRRORED live as one UDP
+ * datagram per line to the dev Mac (b34 — remote-syslog pattern: `make
+ * logtail` on the host tails it in real time; fire-and-forget, lost
+ * datagrams cost nothing, and the file stays as the offline fallback).
+ * Best-effort everywhere: a logger must never get in the way. */
+#define CQ_LOG_HOST "10.0.1.165"   /* the dev Mac's LAN address */
+#define CQ_LOG_PORT 5514
+static short gLogRef = 0;    /* 0 = not open yet */
+
+static void DbgLog(const char *fmt, ...)
+{
+    char          buf[300];
+    int           n;
+    long          cnt;
+    unsigned long t;
+    va_list       ap;
+
+    if (!gLogRef) {
+        FSSpec sp;
+        OSErr  e;
+        unsigned char pname[64];   /* "Casquinha <tag>.log": one log PER BUILD,
+                                      so a VM session can never be misread
+                                      against the wrong binary's log */
+        int    pn = snprintf((char *)pname + 1, sizeof(pname) - 1,
+                             "Casquinha %s.log", CQ_BUILD_TAG);
+        pname[0] = (unsigned char)pn;
+        e = FSMakeFSSpec(0, 0, pname, &sp);              /* app's folder */
+        if (e != noErr && e != fnfErr) return;
+        FSpCreate(&sp, 'ttxt', 'TEXT', smSystemScript);  /* harmless if it exists */
+        if (FSpOpenDF(&sp, fsRdWrPerm, &gLogRef) != noErr) { gLogRef = 0; return; }
+        SetFPos(gLogRef, fsFromLEOF, 0);                 /* append across runs */
+    }
+    t = (unsigned long)TickCount();
+    n = snprintf(buf, sizeof(buf) - 2, "[%lu.%02lus] ", t / 60, (t % 60) * 100 / 60);
+    va_start(ap, fmt);
+    n += vsnprintf(buf + n, sizeof(buf) - 2 - (size_t)n, fmt, ap);
+    va_end(ap);
+    if (n > (int)sizeof(buf) - 2) n = (int)sizeof(buf) - 2;
+    buf[n++] = '\r';                                     /* classic line ending */
+    cnt = n;
+    FSWrite(gLogRef, &cnt, buf);
+    FlushVol(NULL, 0);        /* commit now — the tail must survive a freeze */
+    buf[n - 1] = '\n';        /* unix ending for the live tail */
+    cq_tx_udp(CQ_LOG_HOST, CQ_LOG_PORT, buf, (size_t)n);
+}
+
 /* --- transport controls (Fio 4) --- */
 static ControlHandle gPrev = NULL, gPlay = NULL, gNext = NULL, gVol = NULL;
 static cq_debounce   gDeb;               /* pre-wire coalescer for prev/next (law 1) */
@@ -126,26 +180,42 @@ static char          gCoverReq[64]   = "";  /* album_id being fetched */
 #define CQ_MAX_INFLIGHT 3      /* automatic starters (cover, queue poll) wait above this */
 static int TxInFlight(void);   /* defined after the last transport global (gPls) */
 
-/* --- search + queue windows (Fio 7) --- */
-static WindowRef     gSearchWin = NULL;
+/* --- search + queue, IN the main window (Fio 7; promoted from separate
+ * windows in b30 — menu/window juggling starved the audio ring, and the
+ * queue deserves to be a glance away). Lists + controls live in gWindow. */
 static ListHandle    gSearchList = NULL;
 static ControlHandle gSearchEdit = NULL;
 static cq_transport *gSearchTx = NULL;
 static cq_track_list gSearchItems;
-static WindowRef     gQueueWin = NULL;
 static ListHandle    gQueueList = NULL;
 static cq_transport *gQueueTx = NULL;
 static cq_track_list gQueueItems;
 static unsigned long gQueueLast = 0;        /* last /queue fetch (ticks) */
-#define CQ_QUEUE_POLL_TICKS 300             /* re-fetch every 5 s while the window is open */
+#define CQ_QUEUE_POLL_TICKS 600             /* re-fetch every 10 s — the queue is
+                                              ALWAYS visible now, so the poll is
+                                              permanent: halve the old cadence per
+                                              the exhaustion discipline (Fio E/H);
+                                              the post-command kick keeps it live */
 static cq_backoff    gQBackoff;             /* queue re-fetch cadence, backs off on errors (Fio D) */
 static unsigned long gQueueKick = 0;        /* one-shot /queue refetch due at this tick (Fio H); 0 = none */
+static int           gQueueEmptyRuns = 0;   /* consecutive empty /queue replies (b33: only 3 in a row
+                                              are believed — idle/racing players read as empty) */
 /* Double-click a queue row = play that track directly with one /spot/play?uri=
- * (see AuxClick). The Web API has no jump-to-queue-index; chaining /next per row
- * was N rate-limited player calls and a visible FFwd, so one-call direct play
+ * (see DoContentClick). The Web API has no jump-to-queue-index; chaining /next per
+ * row was N rate-limited player calls and a visible FFwd, so one-call direct play
  * won out (tradeoff: the track may replay later — it isn't removed from queue). */
 static ControlHandle gSearchBtn = NULL;
 static ControlHandle gQueueAddBtn = NULL;   /* "Add to Queue" on the selected search row */
+static ControlHandle gListenBtn = NULL;     /* Listen <-> Stop toggle (b30) */
+static ControlHandle gWakeBtn = NULL;       /* transfer playback to gopher-spot */
+
+/* Shelf geometry (b30): the player area above CQ_SHELF_TOP is redrawn by the
+ * 2 Hz animator; everything below is controls + List Manager territory and
+ * only repaints on real update events (or the animator would wipe it). */
+#define CQ_SHELF_TOP    232
+#define CQ_LIST_TOP     310
+#define CQ_LIST_BOTTOM  474
+#define CQ_LABEL_Y      304   /* breathing room above the -1-inset list frames */
 
 /* -------------------------------------------------------------------------- */
 
@@ -219,7 +289,11 @@ static void DrawWindowContents(WindowRef win)
     Rect  sep;
 
     SetPort((GrafPtr)win);
-    /* Platinum: fill with the theme window background, not raw white. */
+    /* Platinum: fill with the theme window background, not raw white.
+     * ONLY the player area — the shelf below (search/queue lists) is List
+     * Manager territory and repaints on update events; erasing it from the
+     * 2 Hz animator would blank the lists twice a second (b30). */
+    SetRect(&pr, 0, 0, W, CQ_SHELF_TOP);
     SetThemeWindowBackground(win, kThemeBrushDialogBackgroundActive, false);
     EraseRect(&pr);
     DrawControls(win);        /* transport buttons + volume slider (Fio 4) */
@@ -340,6 +414,44 @@ static void DrawWindowContents(WindowRef win)
     }
 }
 
+/* The static shelf furniture (b30): separator, list labels, list frames.
+ * Drawn ONLY on real update events — the 2 Hz animator never touches it. */
+static void DrawShelf(WindowRef win)
+{
+    Rect  pr = ((GrafPtr)win)->portRect;
+    short W  = pr.right - pr.left;
+    Rect  sep;
+
+    SetPort((GrafPtr)win);
+    /* fresh background for the shelf; the caller re-draws controls + lists */
+    SetRect(&sep, 0, CQ_SHELF_TOP, W, pr.bottom);
+    SetThemeWindowBackground(win, kThemeBrushDialogBackgroundActive, false);
+    EraseRect(&sep);
+    SetRect(&sep, 16, CQ_SHELF_TOP, W - 16, CQ_SHELF_TOP + 2);
+    DrawThemeSeparator(&sep, kThemeStateActive);
+
+    TextFont(1); TextSize(9);
+    ThemeText(kThemeTextColorDialogInactive);
+    DrawCStr(16, CQ_LABEL_Y, "Results");
+    DrawCStr(W / 2 + 4, CQ_LABEL_Y, "Up Next");
+
+    /* Frame the WHOLE list — rView excludes the scrollbar (LNew carves 15 px
+     * off), so framing rView alone leaves the scrollbar floating outside the
+     * box (b32 screenshot). Widen back over it, inset -1 for the border. */
+    if (gSearchList) {
+        Rect fr = (*gSearchList)->rView;
+        fr.right += 15;
+        InsetRect(&fr, -1, -1);
+        FrameRect(&fr);
+    }
+    if (gQueueList) {
+        Rect fr = (*gQueueList)->rView;
+        fr.right += 15;
+        InsetRect(&fr, -1, -1);
+        FrameRect(&fr);
+    }
+}
+
 static void Redraw(void)
 {
     if (gWindow) DrawWindowContents(gWindow);
@@ -352,13 +464,49 @@ static void UpdatePlayTitle(void)
         SetControlTitle(gPlay, gSnap.state == CQ_STATE_PLAYING ? "\pPause" : "\pPlay");
 }
 
+static void StartCommand(const char *sel);   /* defined with the transport glue */
+static void PlayItem(cq_track_list *items, int row);   /* search/queue section */
+static void PlayFrom(cq_track_list *items, int row, cq_track_list *cont);
+static void StartFire(const char *sel);
+static void EscInto(const char *s, char *out, size_t max, int keepColon);
+static int gAutoNexted = 0;   /* end-of-track watchdog: one auto-next per stop */
+
+/* Native play-from (b41, SPEC-play-from.md): /spot/api/1/play/from?ids=…
+ * hands Spotify a real multi-track context so advance/next/prev are native.
+ * 0 = unprobed, 1 = server has it, -1 = not_found (fall back to the b40
+ * single-uri + client-sequencer path). gFallbackUri holds the clicked
+ * track's uri while a probe is in flight, so a not_found reply can replay
+ * the user's intent the old way. */
+static int  gNativePlay = 0;
+static char gFallbackUri[128] = "";
+
+/* The row AFTER the current track in the visible queue — the client-side
+ * "play from here onward" cursor (b40). Spotify cannot jump into a queue, so
+ * jumps play bare URIs and the server queue is never consumed; the visible
+ * list therefore IS the playlist, and the app sequences it: find the current
+ * track_id among the rows, return the next one. Not found -> the head (0);
+ * nothing after it (or an empty list) -> -1, playback honestly ends. */
+static int QueueNextRow(void)
+{
+    size_t i;
+    if (gQueueItems.count == 0) return -1;
+    if (!gSnap.track_id) return 0;
+    for (i = 0; i < gQueueItems.count; i++) {
+        const char *u  = gQueueItems.items[i].uri;
+        const char *id = u ? strrchr(u, ':') : NULL;   /* "spotify:track:<id>" */
+        if (id && strcmp(id + 1, gSnap.track_id) == 0)
+            return ((i + 1) < gQueueItems.count) ? (int)(i + 1) : -1;
+    }
+    return 0;
+}
+
 /*
  * Adopt a /now-shaped reply from EITHER a poll or a command. Checks the error
  * key first (law 6), adopts a healthy snapshot through the ts-guard (laws 2/3),
  * and drives the backoff. A command's reply is authoritative — it comes through
  * the same guard, so no catch-up poll storm (law 3).
  */
-static void AdoptReply(const unsigned char *d, size_t len)
+static void AdoptReply(const unsigned char *d, size_t len, int isCmd)
 {
     cq_fields f;
     const char *err;
@@ -378,17 +526,74 @@ static void AdoptReply(const unsigned char *d, size_t len)
          * other code (upstream, ...) backs the poll off as before. */
         if (strcmp(err, "rate_limited") == 0) {
             snprintf(gLastMsg, sizeof(gLastMsg), "Spotify busy - holding steady");
+        } else if (isCmd && strcmp(err, "not_found") == 0 && gFallbackUri[0]) {
+            /* The play/from probe hit an old server (b41): flip to the b40
+             * path once and replay the user's intent as a single-uri play —
+             * the client sequencer resumes duty. Not a poll failure: no
+             * backoff. gFallbackUri is only ever set by PlayFrom, and
+             * commands are serialized (StartCommand drops overlaps), so this
+             * not_found is provably ours. */
+            char euri[128], sel2[192];
+            gNativePlay = -1;
+            DbgLog("play/from: not_found - old server, single-uri fallback");
+            EscInto(gFallbackUri, euri, sizeof(euri), 1);
+            snprintf(sel2, sizeof(sel2), "/spot/play?uri=%s", euri);
+            gFallbackUri[0] = '\0';
+            StartFire(sel2);
         } else {
             snprintf(gLastMsg, sizeof(gLastMsg), "server error: %s", err);
             cq_backoff_fail(&gBackoff);
         }
     } else {
+        if (isCmd && gFallbackUri[0]) {
+            /* the play/from reply came back a healthy snapshot: native it is */
+            if (gNativePlay == 0)
+                DbgLog("play/from: server supports it - native contexts on");
+            gNativePlay = 1;
+            gFallbackUri[0] = '\0';
+        }
         cq_now tmp;
         cq_backoff_ok(&gBackoff);
         cq_now_from_fields(&tmp, &f);
         if (cq_guard_accept_ts(&gGuard, tmp.ts)) {
             int volHeld = (long)((TickCount() - gVolHold)) < 0;  /* within hold window? */
             int keepVol = gSnap.volume;
+            /* End-of-track watchdog (b35): one-call direct play (`play?uri=`)
+             * gives Spotify a single-track context, and librespot STOPS at
+             * its end instead of pulling the queue (b33: 2:20/2:20 frozen,
+             * queue full, /now confirmed `stopped`). When playing-near-the-
+             * end flips to stopped while our queue view has items, do what a
+             * human would — ONE /next. Single-shot per stop; re-arms only
+             * when playback actually resumes, so it can never storm the
+             * rate-limited player endpoint. */
+            if (tmp.state == CQ_STATE_STOPPED && !gAutoNexted &&
+                gHaveSnap && gSnap.state == CQ_STATE_PLAYING &&
+                gSnap.duration_ms > 0 &&
+                gSnap.position_ms >= gSnap.duration_ms - 10000) {
+                /* Sequence the VISIBLE queue: play the row after the track
+                 * that just ended (b40 — "from here onward"), via a bare
+                 * play?uri= (from a dead single-track context /next no-ops
+                 * or NO_ACTIVE_DEVICEs, b35 field report). gSnap still holds
+                 * the ended track here — adoption happens below. */
+                int row = QueueNextRow();
+                gAutoNexted = 1;
+                if (row >= 0) {
+                    DbgLog("watchdog: track ended - playing queue from row %d of %ld",
+                           row, (long)gQueueItems.count);
+                    PlayFrom(&gQueueItems, row, NULL);
+                } else if (gQueueItems.count > 0) {
+                    DbgLog("watchdog: track ended - end of visible queue");
+                }
+            } else if (tmp.state == CQ_STATE_PLAYING) {
+                gAutoNexted = 0;
+            }
+            /* Track changed = the queue definitely moved (head consumed /
+             * jump landed). Kick ONE queue re-poll now instead of waiting
+             * out the 10 s cadence — event-driven freshness at ~one extra
+             * poll per track (b39: the UI felt ~30 s behind). */
+            if (tmp.track_id && (!gSnap.track_id ||
+                                 strcmp(tmp.track_id, gSnap.track_id) != 0))
+                gQueueKick = (unsigned long)TickCount() + 120;
             cq_now_free(&gSnap);
             gSnap = tmp;
             gHaveSnap = true;
@@ -416,7 +621,7 @@ static int PumpTx(cq_transport **txp, int isPoll)
     if (st == CQ_TX_DONE) {
         size_t len = 0;
         const unsigned char *d = cq_tx_data(tx, &len);
-        AdoptReply(d, len);
+        AdoptReply(d, len, !isPoll);
         /* A command reply IS the fresh snapshot — push the next poll a full
          * interval out (CLIENTS.md checklist 4: no /now within ~1 s, Fio G). */
         if (!isPoll) gLastPoll = (unsigned long)TickCount();
@@ -545,10 +750,40 @@ static void PollNetwork(void)
 /* -------------------------------------------------------------------------- */
 
 /* Create the transport controls (themed by the Appearance Manager). */
+/* Shelf actions — defined with the search/queue code below. */
+static ListHandle MakeList(WindowRef win, const Rect *area);
+static void RunSearch(void);
+static void QueueSelected(void);
+static void ToggleListen(void);
+
+/* Next that OBEYS what the screen shows (b37): /next assumes Spotify has a
+ * live context to skip within — from a stopped/bare-URI state it no-ops or
+ * fails NO_ACTIVE_DEVICE while the user stares at a full queue. If nothing
+ * is playing and the visible queue has a head, play that head directly. */
+static void NextCommand(void)
+{
+    if (gSnap.state != CQ_STATE_PLAYING) {
+        int row = QueueNextRow();
+        if (row >= 0) {
+            DbgLog("next: player not playing - playing queue from row %d", row);
+            PlayFrom(&gQueueItems, row, NULL);
+            return;
+        }
+    }
+    cq_debounce_set(&gDeb, "/spot/api/1/next");
+    gCmdFire = (unsigned long)TickCount() + CQ_DEBOUNCE_TICKS;
+}
+
 static void MakeControls(WindowRef win)
 {
     Rect r;
     short W = ((GrafPtr)win)->portRect.right - ((GrafPtr)win)->portRect.left;
+    ControlHandle root;
+
+    /* Appearance keyboard focus REQUIRES an embedding hierarchy: without a
+     * root control SetKeyboardFocus fails (errNoRootControl) and the search
+     * field can never take keystrokes. Must precede every NewControl. */
+    CreateRootControl(win, &root);
 
     SetRect(&r,  16, 156,  92, 176); gPrev = NewControl(win, &r, "\pPrev", true, 0, 0, 0, pushButProc, 0);
     SetRect(&r, 100, 156, 196, 176); gPlay = NewControl(win, &r, "\pPlay", true, 0, 0, 0, pushButProc, 0);
@@ -556,6 +791,25 @@ static void MakeControls(WindowRef win)
     /* Volume slider 0..100. */
     SetRect(&r, 300, 160, W - 16, 176);
     gVol = NewControl(win, &r, "\p", true, 50, 0, 100, kControlSliderProc, 0);
+
+    /* --- the shelf (b30): search + queue + audio controls, always visible.
+     * Menu tracking freezes the cooperative loop (and thus starves the audio
+     * ring), so everything you'd touch mid-listening lives HERE. */
+    SetRect(&r, 16, 240, W - 88, 262);
+    gSearchEdit = NewControl(win, &r, "\p", true, 0, 0, 0, kControlEditTextProc, 0);
+    SetRect(&r, W - 80, 238, W - 16, 260);
+    gSearchBtn = NewControl(win, &r, "\pSearch", true, 0, 0, 0, pushButProc, 0);
+    SetRect(&r, 16, 268, 126, 288);
+    gQueueAddBtn = NewControl(win, &r, "\pAdd to Queue", true, 0, 0, 0, pushButProc, 0);
+    SetRect(&r, 134, 268, 214, 288);
+    gListenBtn = NewControl(win, &r, "\pListen", true, 0, 0, 0, pushButProc, 0);
+    SetRect(&r, 222, 268, 302, 288);
+    gWakeBtn = NewControl(win, &r, "\pWake", true, 0, 0, 0, pushButProc, 0);
+
+    SetRect(&r, 16, CQ_LIST_TOP, W / 2 - 6, CQ_LIST_BOTTOM);
+    gSearchList = MakeList(win, &r);
+    SetRect(&r, W / 2 + 4, CQ_LIST_TOP, W - 16, CQ_LIST_BOTTOM);
+    gQueueList = MakeList(win, &r);
 }
 
 /* A click in the window content: transport buttons, volume slider, or a seek
@@ -570,13 +824,20 @@ static void DoContentClick(WindowRef win, Point where)
     GlobalToLocal(&where);
 
     if (FindControl(where, win, &ctl) && ctl) {
+        if (ctl == gSearchEdit) {
+            /* Appearance edit-text needs explicit keyboard focus — without it
+             * HandleControlKey delivers keystrokes to an unfocused control and
+             * typing never lands. */
+            SetKeyboardFocus(win, ctl, kControlFocusNextPart);
+            HandleControlClick(ctl, where, 0, NULL);
+            return;
+        }
         if (TrackControl(ctl, where, NULL)) {
             if (ctl == gPrev) {              /* debounced (law 1) */
                 cq_debounce_set(&gDeb, "/spot/api/1/prev");
                 gCmdFire = (unsigned long)TickCount() + CQ_DEBOUNCE_TICKS;
             } else if (ctl == gNext) {
-                cq_debounce_set(&gDeb, "/spot/api/1/next");
-                gCmdFire = (unsigned long)TickCount() + CQ_DEBOUNCE_TICKS;
+                NextCommand();               /* obeys the visible queue (b37) */
             } else if (ctl == gPlay) {       /* immediate toggle */
                 StartCommand(gSnap.state == CQ_STATE_PLAYING ?
                              "/spot/api/1/pause" : "/spot/api/1/play");
@@ -585,6 +846,17 @@ static void DoContentClick(WindowRef win, Point where)
                 snprintf(sel, sizeof(sel), "/spot/api/1/volume?%d", GetControlValue(gVol));
                 gVolHold = (unsigned long)TickCount() + CQ_HOLD_TICKS;
                 StartCommand(sel);
+            } else if (ctl == gSearchBtn) {
+                RunSearch();
+            } else if (ctl == gQueueAddBtn) {
+                QueueSelected();
+            } else if (ctl == gListenBtn) {  /* toggle; title tracks the state */
+                ToggleListen();
+            } else if (ctl == gWakeBtn) {
+                /* Transfer playback onto the librespot device (+ resume) so
+                 * the audio stream carries it. wake returns a /now-shaped
+                 * reply, so it goes through StartCommand/AdoptReply. */
+                StartCommand("/spot/api/1/wake?play=1");
             }
         }
         return;
@@ -602,6 +874,34 @@ static void DoContentClick(WindowRef win, Point where)
         ms = (long long)gSnap.duration_ms * frac / span;
         snprintf(sel, sizeof(sel), "/spot/api/1/seek?%ld", (long)ms);
         StartCommand(sel);
+        return;
+    }
+
+    /* The lists: single click selects, double click plays. Both jump straight
+     * to the clicked track with ONE /spot/play?uri= (PlayItem). The queue used
+     * to chain N /next hops to consume the intervening rows and avoid a
+     * duplicate, but that's N calls to the rate-limited player endpoint and a
+     * visible FFwd per row; Spotify has no jump-to-queue-index, so one-call
+     * direct play is the cheap choice. Tradeoff: the chosen track may remain
+     * in up-next and replay later. */
+    {
+        ListHandle list = NULL;
+        cq_track_list *items = NULL;
+        if (gSearchList && PtInRect(where, &(*gSearchList)->rView)) {
+            list = gSearchList; items = &gSearchItems;
+        } else if (gQueueList && PtInRect(where, &(*gQueueList)->rView)) {
+            list = gQueueList; items = &gQueueItems;
+        }
+        if (list && LClick(where, 0, list)) {     /* double-click a row */
+            Cell c;
+            SetPt(&c, 0, 0);
+            if (LGetSelect(true, &c, list)) {
+                /* Native contexts (b41): a queue row plays from there onward;
+                 * a search hit plays now and continues with the queue. */
+                if (list == gSearchList) PlayFrom(items, c.v, &gQueueItems);
+                else                     PlayFrom(items, c.v, NULL);
+            }
+        }
     }
 }
 
@@ -652,14 +952,12 @@ static void FillList(ListHandle list, cq_track_list *items)
     }
 }
 
-static ListHandle MakeList(WindowRef win, short top, short bottom)
+static ListHandle MakeList(WindowRef win, const Rect *area)
 {
-    Rect view, bounds;
+    Rect view = *area, bounds;
     Point csize;
-    short W = ((GrafPtr)win)->portRect.right - ((GrafPtr)win)->portRect.left;
-    short H = ((GrafPtr)win)->portRect.bottom - ((GrafPtr)win)->portRect.top;
     ListHandle l;
-    SetRect(&view, 8, top, W - 8 - 15, H - bottom); /* room for the vertical scrollbar */
+    view.right -= 15;                       /* room for the vertical scrollbar */
     /* dataBounds: columns = right-left, rows = bottom-top -> ONE column, zero
      * rows (rows come from LAddRow). 0,0,0,1 was zero columns: LSetCell had no
      * cell (0,i) to write, so every list rendered empty. */
@@ -688,20 +986,49 @@ static void PlayItem(cq_track_list *items, int row)
     StartFire(sel);
 }
 
-static void OpenQueue(void)
+/* Native "from here onward" (b41, design/SPEC-play-from.md): send bare track
+ * ids — the clicked row plus its continuation — to /spot/api/1/play/from,
+ * handing Spotify a real multi-track context: advance/next/prev then behave
+ * natively, no client sequencing. cont = the follow-on list (the queue after
+ * a search hit), or NULL to continue with the rest of `items`. Capped at 24
+ * ids (spec; geomyidae's request-line buffer). Old servers answer not_found
+ * and AdoptReply replays the intent as a b40 single-uri play. */
+static void PlayFrom(cq_track_list *items, int row, cq_track_list *cont)
 {
-    Rect r;
-    if (gQueueWin) { SelectWindow(gQueueWin); }
-    else {
-        SetRect(&r, 96, 96, 96 + 320, 96 + 260);
-        gQueueWin = NewCWindow(NULL, &r, "\pQueue", true, documentProc, (WindowPtr)-1, true, 0);
-        SetPort((GrafPtr)gQueueWin);
-        gQueueList = MakeList(gQueueWin, 8, 8);
+    char   sel[900];
+    size_t o, i;
+    int    n = 0;
+    cq_track_list *rest = cont ? cont : items;
+    size_t start        = cont ? 0    : (size_t)row + 1;
+
+    if (row < 0 || (size_t)row >= items->count || !items->items[row].uri) return;
+    if (gNativePlay < 0) { PlayItem(items, row); return; }   /* known-old server */
+    if (gCmd) return;                    /* commands are serialized (StartCommand) */
+
+    o = (size_t)snprintf(sel, sizeof(sel), "/spot/api/1/play/from?ids=");
+    {   /* the clicked row first... */
+        const char *id = strrchr(items->items[row].uri, ':');
+        if (!id || !id[1]) { PlayItem(items, row); return; }
+        o += (size_t)snprintf(sel + o, sizeof(sel) - o, "%s", id + 1);
+        n = 1;
     }
-    if (!gQueueTx) {
-        gQueueTx = cq_tx_new(gHost, gPort, "/spot/api/1/queue");
-        if (gQueueTx) cq_tx_start(gQueueTx);
+    /* ...then the continuation */
+    for (i = start; i < rest->count && n < 24; i++) {
+        const char *u  = rest->items[i].uri;
+        const char *id = u ? strrchr(u, ':') : NULL;
+        if (!id || !id[1]) continue;
+        if (o + strlen(id + 1) + 16 >= sizeof(sel)) break;
+        sel[o++] = ',';
+        o += (size_t)snprintf(sel + o, sizeof(sel) - o, "%s", id + 1);
+        n++;
     }
+    snprintf(sel + o, sizeof(sel) - o, "&offset=0");
+
+    strncpy(gFallbackUri, items->items[row].uri, sizeof(gFallbackUri) - 1);
+    gFallbackUri[sizeof(gFallbackUri) - 1] = '\0';
+    DbgLog("play/from: %d ids (row %d)%s", n, row,
+           gNativePlay == 0 ? " [probe]" : "");
+    StartCommand(sel);
 }
 
 static void RunSearch(void)
@@ -722,32 +1049,8 @@ static void RunSearch(void)
     if (gSearchTx) cq_tx_start(gSearchTx);
 }
 
-static void OpenSearch(void)
-{
-    Rect r, er, br;
-    ControlHandle root;
-    if (gSearchWin) { SelectWindow(gSearchWin); return; }
-    SetRect(&r, 116, 116, 116 + 340, 116 + 280);
-    gSearchWin = NewCWindow(NULL, &r, "\pSearch", true, documentProc, (WindowPtr)-1, true, 0);
-    SetPort((GrafPtr)gSearchWin);
-    /* Appearance keyboard focus REQUIRES an embedding hierarchy: without a root
-     * control SetKeyboardFocus fails (errNoRootControl) and the edit field can
-     * never take keystrokes. Must precede the NewControl calls so they embed. */
-    CreateRootControl(gSearchWin, &root);
-    SetRect(&er, 8, 8, 340 - 8 - 70, 26);
-    gSearchEdit = NewControl(gSearchWin, &er, "\p", true, 0, 0, 0, kControlEditTextProc, 0);
-    SetRect(&br, 340 - 8 - 64, 6, 340 - 8, 26);
-    gSearchBtn = NewControl(gSearchWin, &br, "\pSearch", true, 0, 0, 0, pushButProc, 0);
-    /* Bottom row: enqueue the selected result (double-click still = play now). */
-    SetRect(&br, 8, 280 - 28, 8 + 110, 280 - 8);
-    gQueueAddBtn = NewControl(gSearchWin, &br, "\pAdd to Queue", true, 0, 0, 0, pushButProc, 0);
-    gSearchList = MakeList(gSearchWin, 36, 36);   /* leave room for the button row */
-    /* Focus the field on open so ⌘F -> type -> Return just works. */
-    if (gSearchEdit) SetKeyboardFocus(gSearchWin, gSearchEdit, kControlFocusNextPart);
-}
-
 /* Enqueue the selected search row (`/queue/add`, fire-and-forget). The reply is
- * a /queue snapshot we discard; PumpAux refreshes the queue window when the
+ * a /queue snapshot we discard; PumpAux refreshes the queue list when the
  * fire completes. Eventually consistent (~1-2 s), like every command. */
 static void QueueSelected(void)
 {
@@ -761,142 +1064,469 @@ static void QueueSelected(void)
     StartFire(sel);
 }
 
-/* Close one of the auxiliary windows, freeing its list + items. */
-static void CloseAux(WindowRef win)
-{
-    if (win == gQueueWin) {
-        if (gQueueList) LDispose(gQueueList);
-        cq_track_list_free(&gQueueItems);
-        if (gQueueTx) { cq_tx_cancel(gQueueTx); cq_tx_free(gQueueTx); gQueueTx = NULL; }
-        gQueueKick = 0;                       /* a pending kick dies with the window */
-        DisposeWindow(win);
-        gQueueWin = NULL; gQueueList = NULL;
-    } else if (win == gSearchWin) {
-        if (gSearchList) LDispose(gSearchList);
-        cq_track_list_free(&gSearchItems);
-        if (gSearchTx) { cq_tx_cancel(gSearchTx); cq_tx_free(gSearchTx); gSearchTx = NULL; }
-        DisposeWindow(win);
-        gSearchWin = NULL; gSearchList = NULL; gSearchEdit = NULL; gSearchBtn = NULL;
-        gQueueAddBtn = NULL;
-    }
-}
+/* --- audio: live Icecast MP3 — OUR wire, QuickTime as codec only (b16) -----
+ *
+ * QT's URL data handler cannot open a length-less live stream: b13–b15 logs
+ * show the MP3 importer parked at kMovieLoadStateLoading with 0 tracks for a
+ * full minute (idle-import flag included) while our own OT probe pulled 87 KB
+ * in 5 s from the same URL. So the Movie Toolbox is out of the audio path:
+ *
+ *   cq_tx_stream (endless OT read)  ->  HTTP header skip  ->  cq_mp3 sync
+ *     ->  SoundConverter '.mp3' -> 'twos' PCM  ->  SndChannel bufferCmds
+ *
+ * Everything advances in bounded slices from the event loop. The ONLY
+ * interrupt-time code is AudioBufDone flipping a buffer-free flag; the
+ * converter runs in loop context and pulls compressed bytes via AudioFill. */
+typedef enum { AU_IDLE = 0, AU_HTTP, AU_SYNC, AU_PLAY } au_state;
 
-/* Click inside a list window: a control (search field/button) or the list. */
-static void AuxClick(WindowRef win, Point where)
-{
-    ControlHandle ctl;
-    ListHandle list = (win == gQueueWin) ? gQueueList : gSearchList;
-    cq_track_list *items = (win == gQueueWin) ? &gQueueItems : &gSearchItems;
+/* Output stage (b25): SndPlayDoubleBuffer + a PCM ring — the canonical OS 9
+ * streaming architecture, adopted after the bufferCmd+callBackCmd bookkeeping
+ * provably broke under pressure (b24 log: "played" outran wall-clock by 33%,
+ * i.e. busy flags cleared early, queued buffers got overwritten with newer
+ * audio = the chops-and-overlaps). Here the race is impossible by shape:
+ * the interrupt-time double-back proc ONLY reads the ring, the event loop
+ * ONLY writes it (single producer / single consumer, two cursors), and a
+ * starved ring is served as SILENCE — the channel never dies, playback
+ * resumes by itself when the loop refills (menus, drags, dialogs included).
+ *
+ * Radio physics (b23): a live mount arrives at exactly playback rate, so the
+ * cushion never grows on its own — it is BUILT, up front: ~5 s of decoded
+ * PCM before the first note. Startup latency IS the freeze immunity. */
+#define CQ_AUD_RING_BYTES (1536L * 1024L)  /* ~8.7 s of 44.1 kHz stereo 16-bit */
+#define CQ_AUD_CHUNK      (32L * 1024L)    /* per double-buffer refill (~0.19 s) */
+/* Latency knobs (b29/b31): the backlog IS both the command→ear delay and the
+ * freeze/dry-spell immunity — one buys the other. The server side
+ * (librespot→Icecast) adds its own ~1-2 s floor that no client knob removes.
+ *
+ * b31 lesson: b29's "stop decoding at the target" cap did NOT cap latency —
+ * the backlog just moved upstream into the staging (4 s) and transport (4 s)
+ * buffers, invisible and un-trimmed: users felt ~10 s. Now the decoder always
+ * runs (the whole backlog lives IN the ring, where it can be measured) and
+ * excess beyond target+slack is SKIPPED — a one-shot jump-cut back toward
+ * the live edge, applied by the interrupt so the read cursor has exactly one
+ * writer. Normal fill (~prebuffer) sits below the trim threshold, so trims
+ * only fire after freeze/dry-spell catch-ups. */
+#define CQ_AUD_PREBUF_PCM  (384L * 1024L)  /* ~2.2 s decoded before starting */
+#define CQ_AUD_RING_TARGET (512L * 1024L)  /* trim back to ~2.9 s of backlog */
+#define CQ_AUD_TRIM_SLACK  (256L * 1024L)  /* +1.5 s hysteresis before trimming */
+#define CQ_AUD_COMP_MAX   (64 * 1024)      /* compressed staging (decode workspace) */
 
-    SetPort((GrafPtr)win);
-    GlobalToLocal(&where);
-
-    if (win == gSearchWin && FindControl(where, win, &ctl) && ctl) {
-        if (ctl == gSearchBtn) { if (TrackControl(ctl, where, NULL)) RunSearch(); }
-        else if (ctl == gQueueAddBtn) { if (TrackControl(ctl, where, NULL)) QueueSelected(); }
-        else if (ctl == gSearchEdit) {
-            /* Appearance edit-text needs explicit keyboard focus — without it
-             * HandleControlKey delivers keystrokes to an unfocused control and
-             * typing never lands. */
-            SetKeyboardFocus(win, ctl, kControlFocusNextPart);
-            HandleControlClick(ctl, where, 0, NULL);
-        }
-        return;
-    }
-    if (list && LClick(where, 0, list)) {     /* double-click a row */
-        Cell c;
-        SetPt(&c, 0, 0);
-        if (LGetSelect(true, &c, list)) {
-            /* Both windows jump straight to the double-clicked track with ONE
-             * /spot/play?uri= (PlayItem). The queue used to chain N /next hops
-             * to consume the intervening rows and avoid a duplicate, but that's
-             * N calls to the rate-limited player endpoint and a visible FFwd
-             * per row; Spotify has no jump-to-queue-index, so one-call direct
-             * play is the cheap choice. Tradeoff: the chosen track may remain in
-             * up-next and replay later. */
-            PlayItem(items, c.v);
-        }
-    }
-}
-
-/* --- audio: live Icecast MP3 via QuickTime (the deferred, hardest piece) ---
- * Best-effort: discover the stream URL from /spot/stream.pls (cq_pls), then open
- * it as a QuickTime URL movie and service it from the loop with MoviesTask.
- * Classic-QuickTime streaming of a never-ending Icecast feed is finicky; this is
- * NOT runtime-verified and may need iteration on the VM. */
-static Movie         gMovie = NULL;
-static cq_transport *gPls   = NULL;
-static int           gMovieLoading = 0;
-static unsigned long gMovieStart = 0;
+static cq_transport  *gPls    = NULL;   /* /spot/stream.pls discovery */
+static cq_transport  *gStream = NULL;   /* the endless Icecast connection */
+static au_state       gAuSt   = AU_IDLE;
+static unsigned char  gComp[CQ_AUD_COMP_MAX];   /* compressed staging */
+static size_t         gCompLen = 0;
+static cq_mp3_frame   gFmt;             /* from the first confirmed frame */
+static SndChannelPtr  gChan = NULL;
+static Ptr            gRing = NULL;               /* PCM ring, NewPtr'd on first listen */
+static volatile unsigned long gRingWr = 0;        /* bytes written — event loop only */
+static volatile unsigned long gRingRd = 0;        /* bytes read — interrupt only */
+static SndDoubleBackUPP       gDBUPP = NULL;
+static SndDoubleBufferHeader  gDBH;
+static SndDoubleBufferPtr     gDB[2] = { NULL, NULL };
+static int            gPlaying = 0;               /* SndPlayDoubleBuffer issued */
+static volatile long  gDBFires = 0;               /* double-back invocations */
+static volatile long  gDBSilence = 0;             /* refills served as silence */
+static volatile long  gRingSkip = 0;              /* one-shot latency trim request:
+                                                    loop sets it ONLY when zero,
+                                                    interrupt applies + zeroes it —
+                                                    gRingRd keeps a single writer */
+static long           gTrims = 0;                 /* trims this listen */
+static long           gPcmTotal = 0;              /* PCM bytes decoded this listen */
+static long           gDecTicks = 0;              /* ticks spent inside the decoder */
+static long           gDecFrames = 0;             /* frames decoded this listen */
+static unsigned long  gAuBeat = 0;                /* heartbeat log tick */
+static long           gRxTotal = 0;               /* stream bytes received this listen */
 
 /* Every transport that can be in flight at once (Fio E): poll, command,
  * cover, fire, search, queue and pls each ride their own connection, so one
  * client could hold 7 sockets on a fork-per-connection server. The automatic
  * starters (cover, queue poll) wait while at the budget; user-initiated
- * transactions are never gated. */
+ * transactions are never gated. gStream deliberately does NOT count: the
+ * budget protects gopher-spot, and the stream socket goes to Icecast. */
 static int TxInFlight(void)
 {
     return (gTx ? 1 : 0) + (gCmd ? 1 : 0) + (gCover ? 1 : 0) + (gFire ? 1 : 0) +
            (gSearchTx ? 1 : 0) + (gQueueTx ? 1 : 0) + (gPls ? 1 : 0);
 }
 
-static void StopAudio(void)
+static int ParseHttpUrl(const char *url, char *host, size_t hcap,
+                        int *port, char *path, size_t pcap)
 {
-    if (gMovie) { StopMovie(gMovie); DisposeMovie(gMovie); gMovie = NULL; }
-    gMovieLoading = 0;
+    const char *p, *slash, *colon;
+    size_t hn, pn;
+
+    *port = 80;
+    if (strncmp(url, "http://", 7) != 0) return 0;
+    p = url + 7;
+    slash = strchr(p, '/');
+    if (!slash) return 0;
+    colon = strchr(p, ':');
+    if (colon && colon < slash) { *port = atoi(colon + 1); hn = (size_t)(colon - p); }
+    else                        { hn = (size_t)(slash - p); }
+    pn = strlen(slash);
+    if (hn == 0 || hn >= hcap || pn >= pcap) return 0;
+    if (*port <= 0 || *port >= 65536) return 0;
+    memcpy(host, p, hn); host[hn] = '\0';
+    memcpy(path, slash, pn + 1);
+    return 1;
 }
 
-static void OpenStreamURL(const char *url)
+/* Double-back proc — INTERRUPT TIME: refill one hardware buffer from the
+ * ring. Only reads gRingRd/gRingWr and the ring bytes; a starved ring is
+ * served as silence with the buffer still marked ready, so the channel
+ * keeps running and playback resumes on its own. No Memory Manager, no
+ * Toolbox, just copies. */
+static pascal void AudioDoubleBack(SndChannelPtr chan, SndDoubleBufferPtr db)
 {
-    Handle urlH;
-    Movie  mov = NULL;
-    short  resID = 0;
-    OSErr  e;
-    size_t n = strlen(url);
-
-    StopAudio();
-    urlH = NewHandle((Size)n + 1);
-    if (!urlH) return;
-    BlockMoveData(url, *urlH, (Size)n + 1);            /* the URL C string, NUL included */
-    /* ASYNC: NewMovieFromDataRef returns immediately; we poll the load state from
-     * the loop (ServiceAudio). A synchronous open of a never-ending Icecast stream
-     * blocks — and on a cooperative OS that FREEZES THE WHOLE MACHINE. Never do
-     * that (NOTES.md). */
-    e = NewMovieFromDataRef(&mov, newMovieActive | newMovieAsyncOK, &resID,
-                            urlH, URLDataHandlerSubType);
-    DisposeHandle(urlH);
-    if (e != noErr || !mov) return;
-    SetMovieVolume(mov, kFullVolume);
-    gMovie = mov;
-    gMovieLoading = 1;
-    gMovieStart = (unsigned long)TickCount();
+    unsigned long avail;
+    long want = CQ_AUD_CHUNK;
+    (void)chan;
+    gDBFires++;
+    if (gRingSkip > 0) {           /* latency trim: jump-cut toward the live edge */
+        unsigned long s = (unsigned long)gRingSkip;
+        unsigned long have = gRingWr - gRingRd;
+        if (s > have) s = have;
+        gRingRd += s;
+        gRingSkip = 0;
+    }
+    avail = gRingWr - gRingRd;
+    /* Whole chunk or whole silence: padding partial trickles shredded the
+     * audio into ~0.19 s confetti when production lagged (b25). Serving full
+     * silence and leaving the partial to GROW turns a deficit into distinct
+     * pauses instead of machine-gun stutter. (A dead stream's final partial
+     * tail still plays — there is nothing left to wait for.) */
+    long take = (avail >= (unsigned long)want) ? want
+              : ((!gStream && avail > 0) ? (long)avail : 0);
+    if (take > 0) {
+        unsigned long rd = gRingRd % CQ_AUD_RING_BYTES;
+        long first = (long)(CQ_AUD_RING_BYTES - rd);
+        if (first > take) first = take;
+        memcpy(db->dbSoundData, gRing + rd, (size_t)first);
+        if (take > first)
+            memcpy(db->dbSoundData + first, gRing, (size_t)(take - first));
+        gRingRd += (unsigned long)take;
+    }
+    if (take < want) {
+        memset(db->dbSoundData + take, 0, (size_t)(want - take));
+        if (take == 0) gDBSilence++;
+    }
+    db->dbNumFrames = want / (2 * gFmt.channels);
+    db->dbFlags |= dbBufferReady;
 }
 
-/* Service the audio movie from the event loop; never blocks. */
-static void ServiceAudio(void)
+static void StopAudio(const char *why)
 {
-    if (!gMovie) return;
-    MoviesTask(gMovie, 0);                              /* 0 = do a little, return now */
-    if (gMovieLoading) {
-        long ls = GetMovieLoadState(gMovie);
-        if (ls >= kMovieLoadStatePlaythroughOK) {
-            StartMovie(gMovie);                        /* enough buffered — play */
-            gMovieLoading = 0;
-        } else if (ls == kMovieLoadStateError ||
-                   (long)((unsigned long)TickCount() - gMovieStart) > 900) {  /* ~15 s */
-            StopAudio();                               /* give up rather than hang */
+    if (gChan) { SndDisposeChannel(gChan, true); gChan = NULL; }   /* true = quiet NOW */
+    if (gStream) { cq_tx_cancel(gStream); cq_tx_free(gStream); gStream = NULL; }
+    if (gAuSt != AU_IDLE) DbgLog("audio: stopped (%s)", why);
+    gAuSt = AU_IDLE;
+    gCompLen = 0;
+    gPlaying = 0;
+    gRingWr = gRingRd = 0;
+    gRingSkip = 0;
+    if (gListenBtn) SetControlTitle(gListenBtn, "\pListen");   /* toggle shows state */
+}
+
+/* First confirmed frame in hand: reset the decoder and arm the ring. The
+ * decode step is minimp3 (cq_mp3dec) — QuickTime is NOT in this path; b13–b20
+ * proved every QT route (URL movie, SoundConverter pull/push, both MP3
+ * fourccs) consumes the stream and decodes nothing on QT 5.0.2. The channel
+ * itself starts later, once the prebuffer is in the ring. */
+static int OpenAudioOutput(void)
+{
+    if (!gRing) gRing = NewPtr(CQ_AUD_RING_BYTES);
+    if (!gRing) { DbgLog("audio: NewPtr(ring %ld) failed", CQ_AUD_RING_BYTES); return 0; }
+    cq_mp3dec_init();
+    gRingWr = gRingRd = 0;
+    gPlaying = 0;
+    gDBFires = gDBSilence = 0;
+    gRingSkip = 0;
+    gTrims = 0;
+    gPcmTotal = 0;
+    gDecTicks = gDecFrames = 0;
+    DbgLog("audio: output armed (minimp3), %d Hz %dch %d kbps",
+           gFmt.samplerate, gFmt.channels, gFmt.bitrate_kbps);
+    return 1;
+}
+
+/* Prebuffer reached: create the channel and start the double-buffer engine.
+ * Both hardware buffers are pre-filled from the ring before the first note. */
+static int StartDoubleBuffer(void)
+{
+    OSErr e;
+    int b;
+
+    if (!gDBUPP) gDBUPP = NewSndDoubleBackUPP(AudioDoubleBack);
+    for (b = 0; b < 2; b++)
+        if (!gDB[b])
+            gDB[b] = (SndDoubleBufferPtr)NewPtrClear(sizeof(SndDoubleBuffer) + CQ_AUD_CHUNK);
+    if (!gDBUPP || !gDB[0] || !gDB[1]) { DbgLog("audio: double-buffer alloc failed"); return 0; }
+
+    e = SndNewChannel(&gChan, sampledSynth,
+                      gFmt.channels == 1 ? initMono : initStereo, NULL);
+    if (e != noErr) { DbgLog("audio: SndNewChannel err=%d", (int)e); gChan = NULL; return 0; }
+
+    memset(&gDBH, 0, sizeof(gDBH));
+    gDBH.dbhNumChannels   = (short)gFmt.channels;
+    gDBH.dbhSampleSize    = 16;
+    gDBH.dbhCompressionID = 0;
+    gDBH.dbhPacketSize    = 0;
+    gDBH.dbhSampleRate    = (UnsignedFixed)((unsigned long)gFmt.samplerate << 16);
+    gDBH.dbhBufferPtr[0]  = gDB[0];
+    gDBH.dbhBufferPtr[1]  = gDB[1];
+    gDBH.dbhDoubleBack    = gDBUPP;
+    gDB[0]->dbFlags = 0;
+    gDB[1]->dbFlags = 0;
+    AudioDoubleBack(gChan, gDB[0]);              /* pre-fill both buffers */
+    AudioDoubleBack(gChan, gDB[1]);
+    e = SndPlayDoubleBuffer(gChan, &gDBH);
+    if (e != noErr) { DbgLog("audio: SndPlayDoubleBuffer err=%d", (int)e); return 0; }
+    gPlaying = 1;
+    DbgLog("audio: PLAY, ring %ld KB deep", (long)((gRingWr - gRingRd) / 1024));
+    return 1;
+}
+
+/* Decode staged MP3 into the PCM ring (one frame per iteration, wrap-aware),
+ * and start the double-buffer engine once the prebuffer is in. The decoder
+ * skips junk itself; a consumed count of 0 means "partial frame tail — wait
+ * for more bytes". Host-verified against a captured slice of this very
+ * stream (tests/mp3dec_test.c). */
+static void PumpRing(void)
+{
+    static short tmp[CQ_MP3DEC_MAX_SAMPLES];   /* one decoded frame, bounced
+                                                 into the ring with wrap */
+    size_t used = 0;
+
+    for (;;) {
+        unsigned long space = CQ_AUD_RING_BYTES - (gRingWr - gRingRd);
+        int consumed = 0, fch = 0, fhz = 0, s;
+        /* NO latency gate here (b31): pausing the decoder just parks the
+         * backlog upstream in staging + transport where it can't be trimmed.
+         * Decode everything; the trim in ServiceAudio bounds the latency. */
+        if (space < (unsigned long)(CQ_MP3DEC_MAX_SAMPLES * 2)) break;  /* ring full */
+        if (used >= gCompLen) break;                                    /* staging dry */
+        {   /* NEVER feed the decoder an unconfirmed tail: minimp3 treats a
+             * final frame it cannot verify against the NEXT header as junk
+             * and EATS it silently (b26: ~40% of the input vanished this
+             * way, sil 138/207 fires). Hold the tail until its successor is
+             * fully staged; a dead stream flushes its true last frame. */
+            int wf = 0;
+            cq_mp3_walk(gComp + used, gCompLen - used, 2, &wf);
+            if (wf < (gStream ? 2 : 1)) {
+                /* Gate failing at the HEAD with a deep staging = junk from a
+                 * mid-stream splice, and the gate is blocking the very
+                 * resync that would skip it — b27 session 1 deadlocked here
+                 * for 20 s (staging full, rx frozen, ring starved). Realign
+                 * explicitly and drop the prefix. */
+                if (gCompLen - used > 8192) {
+                    cq_mp3_frame nf;
+                    long off = cq_mp3_sync(gComp + used, gCompLen - used, &nf);
+                    if (off > 0) {
+                        DbgLog("audio: resync +%ld (splice junk dropped)", off);
+                        used += (size_t)off;
+                        continue;
+                    }
+                    if (off < 0) {
+                        DbgLog("audio: staging unparseable, flushing %ld B",
+                               (long)(gCompLen - used));
+                        used = gCompLen;
+                    }
+                }
+                break;
+            }
+        }
+        {   /* decode-throughput probe: 60 Hz ticks integrated over many
+             * frames tell whether minimp3 keeps up with realtime (38 fps) */
+            unsigned long t0 = (unsigned long)TickCount();
+            s = cq_mp3dec_frame(gComp + used, gCompLen - used, tmp,
+                                &fch, &fhz, &consumed);
+            gDecTicks += (long)((unsigned long)TickCount() - t0);
+        }
+        if (consumed <= 0) break;                  /* partial tail: need bytes */
+        used += (size_t)consumed;
+        if (s <= 0) continue;                      /* junk skipped */
+        gDecFrames++;
+        {
+            long bytes = (long)s * fch * 2;
+            unsigned long wr = gRingWr % CQ_AUD_RING_BYTES;
+            long first = (long)(CQ_AUD_RING_BYTES - wr);
+            if (first > bytes) first = bytes;
+            memcpy(gRing + wr, tmp, (size_t)first);
+            if (bytes > first)
+                memcpy(gRing, (char *)tmp + first, (size_t)(bytes - first));
+            gRingWr += (unsigned long)bytes;
+            gPcmTotal += bytes;
+        }
+    }
+    if (used) {
+        gCompLen -= used;
+        if (gCompLen) memmove(gComp, gComp + used, gCompLen);
+    }
+
+    if (!gPlaying) {
+        unsigned long fill = gRingWr - gRingRd;
+        /* start at the prebuffer mark — or with whatever remains if the
+         * stream already died (play the tail out rather than sit on it) */
+        if (fill >= (unsigned long)CQ_AUD_PREBUF_PCM || (!gStream && fill > 0)) {
+            if (!StartDoubleBuffer()) StopAudio("output start failed");
         }
     }
 }
 
-/* Listen / Stop toggle. */
+/* Advance the whole audio pipeline one bounded slice; never blocks. */
+static void ServiceAudio(void)
+{
+    if (gAuSt == AU_IDLE) return;
+
+    /* 1) the wire: poll, drain into staging, note death */
+    if (gStream) {
+        cq_tx_status st = cq_tx_poll(gStream);
+        if (gCompLen < sizeof(gComp)) {
+            size_t n = cq_tx_drain(gStream, gComp + gCompLen, sizeof(gComp) - gCompLen);
+            gCompLen += n;
+            gRxTotal += (long)n;
+            /* The first ~12 KB, drain by drain: an impatience-proof rate read.
+             * (VM tests keep getting toggled off within seconds — b16/b17.) */
+            if (n && gRxTotal <= 12288)
+                DbgLog("audio: rx +%ld (total %ld)", (long)n, gRxTotal);
+        }
+        if (st != CQ_TX_RUNNING) {
+            DbgLog("audio: stream %s", st == CQ_TX_DONE ? "closed by server"
+                                                        : cq_tx_error_message(gStream));
+            if (gCompLen < sizeof(gComp))       /* last drain of the buffered tail */
+                gCompLen += cq_tx_drain(gStream, gComp + gCompLen, sizeof(gComp) - gCompLen);
+            cq_tx_free(gStream); gStream = NULL;
+            if (gAuSt != AU_PLAY) { StopAudio("stream died before playback"); return; }
+        }
+    }
+
+    /* 2) strip the HTTP/ICY response header */
+    if (gAuSt == AU_HTTP && gCompLen >= 4) {
+        size_t i;
+        for (i = 0; i + 3 < gCompLen; i++)
+            if (gComp[i] == '\r' && gComp[i+1] == '\n' &&
+                gComp[i+2] == '\r' && gComp[i+3] == '\n') break;
+        if (i + 3 < gCompLen) {
+            {   /* log the status line before dropping the header */
+                char line[81];
+                size_t k, n = 0;
+                for (k = 0; k < gCompLen && n < 80 &&
+                            gComp[k] != '\r' && gComp[k] != '\n'; k++)
+                    line[n++] = (gComp[k] >= 32 && gComp[k] < 127) ? (char)gComp[k] : '.';
+                line[n] = '\0';
+                DbgLog("audio: response \"%s\" (+%ld header bytes)", line, (long)(i + 4));
+            }
+            gCompLen -= i + 4;
+            memmove(gComp, gComp + i + 4, gCompLen);
+            gAuSt = AU_SYNC;
+        } else if (gCompLen > 8192) {
+            StopAudio("no header end in 8 KB");
+            return;
+        }
+    }
+
+    /* 3) find the first confirmed MP3 frame, then open codec + channel */
+    if (gAuSt == AU_SYNC) {
+        long off = cq_mp3_sync(gComp, gCompLen, &gFmt);
+        if (off >= 0) {
+            DbgLog("audio: synced at +%ld: %d Hz %dch %d kbps, %d-byte frames",
+                   off, gFmt.samplerate, gFmt.channels, gFmt.bitrate_kbps,
+                   gFmt.frame_bytes);
+            gCompLen -= (size_t)off;
+            memmove(gComp, gComp + off, gCompLen);
+            if (!OpenAudioOutput()) { StopAudio("output open failed"); return; }
+            gAuSt = AU_PLAY;
+        } else if (gCompLen > 32 * 1024) {
+            StopAudio("no MP3 frame in 32 KB");
+            return;
+        }
+    }
+
+    /* 4) playback: decode into the ring; drained-out = done */
+    if (gAuSt == AU_PLAY) {
+        PumpRing();
+        if (gAuSt != AU_PLAY) return;   /* the pump may give up and stop */
+        /* Latency trim (b31): backlog beyond target+slack means we fell
+         * behind the live edge (menu freeze / dry-spell catch-up). Ask the
+         * interrupt to skip the oldest PCM — one jump-cut back to ~target. */
+        if (gPlaying && gRingSkip == 0) {
+            unsigned long fill = gRingWr - gRingRd;
+            if (fill > (unsigned long)(CQ_AUD_RING_TARGET + CQ_AUD_TRIM_SLACK)) {
+                gRingSkip = (long)(fill - CQ_AUD_RING_TARGET);
+                gTrims++;
+                DbgLog("audio: latency trim, skipping %ld KB of backlog",
+                       (long)((fill - CQ_AUD_RING_TARGET) / 1024));
+            }
+        }
+        if (!gStream && gCompLen == 0 && gPlaying && gRingWr == gRingRd) {
+            StopAudio("played out");
+            return;
+        }
+        if ((unsigned long)TickCount() - gAuBeat >= (gPlaying ? 600 : 300)) {
+            gAuBeat = (unsigned long)TickCount();
+            /* rx total is THE starvation tell: it should grow ~16000 B/s at
+             * 128 kbps; a parked rx total = the mount is dry (Spotify paused /
+             * playing off-device), not a client bug (b16 log). silence>0 with
+             * ring>0 would be the impossible case — the interrupt starving
+             * while the loop has data. */
+            if (!gPlaying)
+                DbgLog("audio: prebuffering ring %ld/%ld KB, %ld rx",
+                       (long)((gRingWr - gRingRd) / 1024),
+                       (long)(CQ_AUD_PREBUF_PCM / 1024), gRxTotal);
+            else {
+                long uok = 0, ufail = 0, uerr = 0;
+                cq_tx_udp_stats(&uok, &ufail, &uerr);
+                DbgLog("audio: playing, ring %ld KB, fires %ld, sil %ld, trims %ld, dec %ldf/%ldt, pcm %ldK, %ld staged, %ld rx, udp %ld/%ld e%ld",
+                       (long)((gRingWr - gRingRd) / 1024),
+                       gDBFires, gDBSilence, gTrims, gDecFrames, gDecTicks,
+                       gPcmTotal / 1024, (long)gCompLen, gRxTotal,
+                       uok, ufail, uerr);
+            }
+        }
+    } else if ((unsigned long)TickCount() - gAuBeat >= 300) {   /* pre-play: ~5 s */
+        gAuBeat = (unsigned long)TickCount();
+        DbgLog("audio: %s, %ld staged, %ld rx",
+               gAuSt == AU_HTTP ? "awaiting header" : "syncing",
+               (long)gCompLen, gRxTotal);
+    }
+}
+
+/* ⌘T target: open the Icecast mount discovered in the PLS. */
+static void StartStream(const char *url)
+{
+    char host[64], path[160], sel[192];
+    int  port;
+
+    if (!ParseHttpUrl(url, host, sizeof(host), &port, path, sizeof(path))) {
+        DbgLog("audio: unparseable url \"%s\"", url);
+        return;
+    }
+    /* selector + the transport's closing CRLF = a complete HTTP/1.0 request
+     * (the blank line) — the exact wire the b15 probe validated. */
+    snprintf(sel, sizeof(sel), "GET %s HTTP/1.0\r\n", path);
+    gStream = cq_tx_stream_new(host, port, sel);
+    if (!gStream) { DbgLog("audio: stream tx alloc failed"); return; }
+    cq_tx_start(gStream);
+    gAuSt = AU_HTTP;
+    gAuBeat = (unsigned long)TickCount();
+    gRxTotal = 0;
+    DbgLog("audio: streaming GET %s:%d%s", host, port, path);
+}
+
+/* Listen / Stop toggle (the gListenBtn title mirrors the state, b30). */
 static void ToggleListen(void)
 {
-    if (!gQTOk) return;
-    if (gMovie) { StopAudio(); return; }
+    if (gAuSt != AU_IDLE) { StopAudio("user toggle"); return; }
     if (gPls) return;
     gPls = cq_tx_new(gHost, gPort, "/spot/stream.pls");   /* discover the stream URL */
-    if (gPls) cq_tx_start(gPls);
+    if (gPls) {
+        cq_tx_start(gPls);
+        if (gListenBtn) SetControlTitle(gListenBtn, "\pStop");
+        DbgLog("audio: fetching /spot/stream.pls from %s:%d", gHost, gPort);
+    } else {
+        DbgLog("audio: pls tx alloc failed");
+    }
 }
 
 /* Advance the search/queue/fire transactions; parse a list reply and fill it. */
@@ -904,13 +1534,11 @@ static void PumpAux(void)
 {
     if (gFire && cq_tx_poll(gFire) != CQ_TX_RUNNING) {
         cq_tx_free(gFire); gFire = NULL;
-        if (gQueueWin) {
-            /* A command (play / queue-add) just landed. The server is eventually
-             * consistent (~1-2 s), so schedule ONE refetch ~2 s out (Fio H,
-             * CLIENTS.md g13) instead of refetching instantly and usually
-             * missing the change. */
-            gQueueKick = (unsigned long)TickCount() + 120;
-        }
+        /* A command (play / queue-add) just landed. The server is eventually
+         * consistent (~1-2 s), so schedule ONE refetch ~2 s out (Fio H,
+         * CLIENTS.md g13) instead of refetching instantly and usually
+         * missing the change. */
+        gQueueKick = (unsigned long)TickCount() + 120;
     }
 
     ServiceAudio();                                       /* non-blocking audio service */
@@ -921,15 +1549,26 @@ static void PumpAux(void)
             size_t len = 0;
             const unsigned char *d = cq_tx_data(gPls, &len);
             char *body = (char *)malloc(len + 1);
+            DbgLog("audio: pls reply %ld bytes", (long)len);
             if (body) {
                 char *url;
                 memcpy(body, d, len); body[len] = '\0';
                 url = cq_pls_first_url(body);             /* PLS/M3U -> first stream URL */
                 free(body);
-                if (url) { OpenStreamURL(url); free(url); }
+                if (url) { StartStream(url); free(url); }
+                else DbgLog("audio: no url found in pls body");
+            } else {
+                DbgLog("audio: pls body malloc(%ld) failed", (long)len + 1);
             }
             cq_tx_free(gPls); gPls = NULL;
-        } else if (st == CQ_TX_FAILED) { cq_tx_free(gPls); gPls = NULL; }
+        } else if (st == CQ_TX_FAILED) {
+            DbgLog("audio: pls fetch FAILED e%d %s",
+                   (int)cq_tx_error_code(gPls), cq_tx_error_message(gPls));
+            cq_tx_free(gPls); gPls = NULL;
+        }
+        /* Discovery over but no stream? The toggle button lied — reset it. */
+        if (!gPls && gAuSt == AU_IDLE && gListenBtn)
+            SetControlTitle(gListenBtn, "\pListen");
     }
 
     if (gSearchTx) {
@@ -948,9 +1587,26 @@ static void PumpAux(void)
         if (st == CQ_TX_DONE) {
             size_t len = 0;
             const unsigned char *d = cq_tx_data(gQueueTx, &len);
-            cq_track_list_free(&gQueueItems);
-            cq_track_list_from_response(&gQueueItems, d, len);
-            FillList(gQueueList, &gQueueItems);
+            cq_track_list fresh;
+            cq_track_list_from_response(&fresh, d, len);
+            /* Law-2 for the queue (b33): Spotify reads as EMPTY during idle /
+             * track changes / rate-limit — with the list always visible, one
+             * spurious empty used to wipe "Up Next" in your face every few
+             * polls. Keep the last non-empty snapshot; adopt empty only when
+             * it repeats (a truly emptied queue settles within ~3 polls). */
+            if (fresh.count > 0) {
+                cq_track_list_free(&gQueueItems);
+                gQueueItems = fresh;
+                FillList(gQueueList, &gQueueItems);
+                gQueueEmptyRuns = 0;
+            } else {
+                cq_track_list_free(&fresh);
+                if (++gQueueEmptyRuns == 2 && gQueueItems.count > 0) {
+                    /* two in a row (b39; was three = a 30 s stale window) */
+                    cq_track_list_free(&gQueueItems);
+                    FillList(gQueueList, &gQueueItems);   /* now genuinely empty */
+                }
+            }
             cq_tx_free(gQueueTx); gQueueTx = NULL;
             gQueueLast = (unsigned long)TickCount();
             cq_backoff_ok(&gQBackoff);
@@ -959,12 +1615,12 @@ static void PumpAux(void)
             gQueueLast = (unsigned long)TickCount();
             cq_backoff_fail(&gQBackoff);   /* failing? re-fetch slower (Fio D) */
         }
-    } else if (gQueueWin && !gSuspended && TxInFlight() < CQ_MAX_INFLIGHT) {
-        /* Keep an open Queue window live (~5 s, backing off on errors): the
-         * queue changes underneath us — adds from the search window, tracks
+    } else if (!gSuspended && TxInFlight() < CQ_MAX_INFLIGHT) {
+        /* Keep the always-visible queue list live (~10 s, backing off on
+         * errors): the queue changes underneath us — adds from search, tracks
          * being consumed, and Spotify's "idle player reads as empty" quirk all
-         * resolve on the next poll instead of requiring a close/reopen. The
-         * kick (Fio H) is the one-shot post-command refetch. */
+         * resolve on the next poll. The kick (Fio H) is the one-shot
+         * post-command refetch that makes adds feel immediate. */
         unsigned long now = (unsigned long)TickCount();
         int due = now - gQueueLast >= (unsigned long)cq_backoff_interval(&gQBackoff);
         if (gQueueKick && (long)(now - gQueueKick) >= 0) due = 1;
@@ -1100,6 +1756,87 @@ static void SetUpMenus(void)
     DrawMenuBar();
 }
 
+/* --- Apple Events (b36): the smoke-test surface ---------------------------
+ * Required suite (oapp/odoc/pdoc no-ops, quit) plus misc/dosc ("do script"),
+ * whose direct object is one command string. From Script Editor on the VM:
+ *     tell application "Casquinha" to «event miscdosc» "listen"
+ * Commands: listen stop play pause next prev wake add search:<query>
+ * Every event is logged, so a scripted run narrates itself in the log. */
+static void DoScriptCmd(const char *cmd)
+{
+    if      (strcmp(cmd, "listen") == 0) { if (gAuSt == AU_IDLE) ToggleListen(); }
+    else if (strcmp(cmd, "stop")   == 0) { if (gAuSt != AU_IDLE) ToggleListen(); }
+    else if (strcmp(cmd, "play")   == 0) StartCommand("/spot/api/1/play");
+    else if (strcmp(cmd, "pause")  == 0) StartCommand("/spot/api/1/pause");
+    else if (strcmp(cmd, "next")   == 0) NextCommand();
+    else if (strcmp(cmd, "prev")   == 0) StartCommand("/spot/api/1/prev");
+    else if (strcmp(cmd, "wake")   == 0) StartCommand("/spot/api/1/wake?play=1");
+    else if (strncmp(cmd, "search:", 7) == 0) {
+        if (gSearchEdit) {
+            SetControlData(gSearchEdit, kControlNoPart, kControlEditTextTextTag,
+                           (Size)strlen(cmd + 7), (Ptr)(cmd + 7));
+            Draw1Control(gSearchEdit);
+            RunSearch();
+        }
+    }
+    else if (strcmp(cmd, "add") == 0) {    /* enqueue the selected (or first) result */
+        Cell c;
+        SetPt(&c, 0, 0);
+        if (gSearchList && !LGetSelect(true, &c, gSearchList) &&
+            gSearchItems.count > 0) {
+            SetPt(&c, 0, 0);
+            LSetSelect(true, c, gSearchList);
+        }
+        QueueSelected();
+    }
+    else DbgLog("apple-event: unknown command \"%s\"", cmd);
+}
+
+static pascal OSErr AENoopHandler(const AppleEvent *evt, AppleEvent *reply, long refCon)
+{
+    (void)evt; (void)reply; (void)refCon;
+    return noErr;
+}
+
+static pascal OSErr AEQuitHandler(const AppleEvent *evt, AppleEvent *reply, long refCon)
+{
+    (void)evt; (void)reply; (void)refCon;
+    DbgLog("apple-event: quit");
+    gRunning = false;
+    return noErr;
+}
+
+static pascal OSErr AEDoScriptHandler(const AppleEvent *evt, AppleEvent *reply, long refCon)
+{
+    char     buf[256];
+    Size     got = 0;
+    DescType typ;
+    OSErr    e;
+    (void)reply; (void)refCon;
+    e = AEGetParamPtr(evt, keyDirectObject, typeChar, &typ,
+                      buf, sizeof(buf) - 1, &got);
+    if (e != noErr) return e;
+    if (got < 0) got = 0;
+    buf[got] = '\0';
+    DbgLog("apple-event: do script \"%s\"", buf);
+    DoScriptCmd(buf);
+    return noErr;
+}
+
+static void InstallAEHandlers(void)
+{
+    AEInstallEventHandler(kCoreEventClass, kAEOpenApplication,
+                          NewAEEventHandlerUPP(AENoopHandler), 0, false);
+    AEInstallEventHandler(kCoreEventClass, kAEOpenDocuments,
+                          NewAEEventHandlerUPP(AENoopHandler), 0, false);
+    AEInstallEventHandler(kCoreEventClass, kAEPrintDocuments,
+                          NewAEEventHandlerUPP(AENoopHandler), 0, false);
+    AEInstallEventHandler(kCoreEventClass, kAEQuitApplication,
+                          NewAEEventHandlerUPP(AEQuitHandler), 0, false);
+    AEInstallEventHandler(kAEMiscStandards, kAEDoScript,
+                          NewAEEventHandlerUPP(AEDoScriptHandler), 0, false);
+}
+
 static void DoMenu(long choice)
 {
     short menu = CQ_HIWORD(choice);
@@ -1117,16 +1854,10 @@ static void DoMenu(long choice)
             }
             break;
         case kFileMenu:
-            if (item == kSearchItem)      OpenSearch();
-            else if (item == kQueueItem)  OpenQueue();
-            else if (item == kListenItem) ToggleListen();
-            /* Transfer playback to the gopher-spot librespot device (?play=1 =
-             * resume on transfer) so the audio stream carries it. wake returns a
-             * /now snapshot, so StartCommand routes it through AdoptReply like
-             * the other transport commands. Recovers `device idle`. */
-            else if (item == kWakeItem)   StartCommand("/spot/api/1/wake?play=1");
-            else if (item == kPrefsItem)  DoPrefs();
-            else if (item == kQuitItem)   gRunning = false;
+            /* b30: search/queue/listen/wake are main-window controls now —
+             * nothing you'd touch mid-listening is left behind a menu. */
+            if (item == kPrefsItem)      DoPrefs();
+            else if (item == kQuitItem)  gRunning = false;
             break;
     }
     HiliteMenu(0);
@@ -1150,15 +1881,12 @@ static void DoMouseDown(EventRecord *ev)
             break;
         }
         case inGoAway:
-            if (TrackGoAway(win, ev->where)) {
-                if (win == gWindow) gRunning = false;
-                else CloseAux(win);
-            }
+            if (TrackGoAway(win, ev->where) && win == gWindow)
+                gRunning = false;
             break;
         case inContent:
             if (win != FrontWindow()) SelectWindow(win);
             else if (win == gWindow)  DoContentClick(win, ev->where);
-            else                      AuxClick(win, ev->where);
             break;
     }
 }
@@ -1167,6 +1895,12 @@ int main(void)
 {
     EventRecord ev;
     GDHandle    gd;
+
+    /* minimp3 keeps ~15 KB of scratch on the STACK per decoded frame; carve
+     * out headroom before anything runs deep (stack grows down into the gap
+     * this opens above the heap), then let the heap take the rest. */
+    SetApplLimit((Ptr)((unsigned long)GetApplLimit() - 64 * 1024));
+    MaxApplZone();
 
     InitGraf(&qd.thePort);
     InitFonts();
@@ -1179,6 +1913,12 @@ int main(void)
     RegisterAppearanceClient();               /* opt into the Platinum look */
 
     gQTOk = (EnterMovies() == noErr);         /* QuickTime for cover-art decode */
+    {   /* boot line: which build, and exactly which QuickTime is under us */
+        long qtv = 0;
+        Gestalt(gestaltQuickTimeVersion, &qtv);
+        DbgLog("boot %s  QT=%s ver=%08lx", CQ_BUILD_TAG,
+               gQTOk ? "ok" : "MISSING", qtv);
+    }
 
     {   /* converters: UTF-8 -> MacRoman (draw) and MacRoman -> UTF-8 (wire) */
         TextEncoding utf8 = CreateTextEncoding(kTextEncodingUnicodeV2_0,
@@ -1203,6 +1943,7 @@ int main(void)
     LoadPrefs();                              /* server address from the prefs file */
     memset(&gSnap, 0, sizeof(gSnap));
 
+    InstallAEHandlers();                       /* scriptability (b36) */
     SetUpMenus();
 
     gWindow = GetNewWindow(kMainWindow, NULL, (WindowPtr)-1);
@@ -1217,7 +1958,7 @@ int main(void)
         /* Short sleep while a fetch is in flight (spin the OT state machine),
          * calmer when idle between polls, calmer still suspended in the
          * background — unless audio is playing, which wants regular service. */
-        long sleep = gTx ? 1L : ((gSuspended && !gMovie) ? 60L : 10L);
+        long sleep = gTx ? 1L : ((gSuspended && gAuSt == AU_IDLE) ? 60L : 10L);
         if (WaitNextEvent(everyEvent, &ev, sleep, NULL)) {
             switch (ev.what) {
                 case mouseDown:
@@ -1227,20 +1968,38 @@ int main(void)
                 case autoKey: {
                     char ch = (char)(ev.message & charCodeMask);
                     if (ev.modifiers & cmdKey) {
-                        DoMenu(MenuKey(ch));
-                    } else if (FrontWindow() == gSearchWin && gSearchEdit) {
-                        if (ch == '\r' || ch == '\n') RunSearch();
-                        else {
-                            /* Same port trap as IdleControls: HandleControlKey
-                             * draws the typed character into the CURRENT port,
-                             * which Redraw() leaves on gWindow — set it to the
-                             * search window or keystrokes never appear. */
-                            GrafPtr save;
-                            GetPort(&save);
-                            SetPort((GrafPtr)gSearchWin);
-                            HandleControlKey(gSearchEdit,
-                                 (short)((ev.message & keyCodeMask) >> 8), ch, ev.modifiers);
-                            SetPort(save);
+                        /* Hand-rolled shortcuts (b30): these actions left the
+                         * menu (menu tracking starves the audio ring) but keep
+                         * their keys. Everything else -> MenuKey (Prefs/Quit). */
+                        if (ch == 'f' || ch == 'F') {
+                            if (gSearchEdit)
+                                SetKeyboardFocus(gWindow, gSearchEdit,
+                                                 kControlFocusNextPart);
+                        } else if (ch == 't' || ch == 'T') {
+                            ToggleListen();
+                        } else if (ch == 'k' || ch == 'K') {
+                            StartCommand("/spot/api/1/wake?play=1");
+                        } else if (ch == 'u' || ch == 'U') {
+                            gQueueKick = (unsigned long)TickCount();  /* refresh now */
+                        } else {
+                            DoMenu(MenuKey(ch));
+                        }
+                    } else {
+                        ControlHandle focus = NULL;
+                        GetKeyboardFocus(gWindow, &focus);
+                        if (focus && focus == gSearchEdit) {
+                            if (ch == '\r' || ch == '\n') RunSearch();
+                            else {
+                                /* Same port trap as IdleControls: HandleControlKey
+                                 * draws the typed character into the CURRENT
+                                 * port — pin it to the window. */
+                                GrafPtr save;
+                                GetPort(&save);
+                                SetPort((GrafPtr)gWindow);
+                                HandleControlKey(gSearchEdit,
+                                     (short)((ev.message & keyCodeMask) >> 8), ch, ev.modifiers);
+                                SetPort(save);
+                            }
                         }
                     }
                     break;
@@ -1249,15 +2008,11 @@ int main(void)
                     WindowRef win = (WindowRef)ev.message;
                     BeginUpdate(win);
                     if (win == gWindow) {
-                        DrawWindowContents(win);
-                    } else {
-                        ListHandle list = (win == gQueueWin) ? gQueueList :
-                                          (win == gSearchWin) ? gSearchList : NULL;
-                        SetPort((GrafPtr)win);
-                        SetThemeWindowBackground(win, kThemeBrushDialogBackgroundActive, false);
-                        EraseRect(&((GrafPtr)win)->portRect);
+                        DrawWindowContents(win);          /* the player area */
+                        DrawShelf(win);                   /* separator/labels/frames */
                         UpdateControls(win, ((GrafPtr)win)->visRgn);
-                        if (list) { LUpdate(((GrafPtr)win)->visRgn, list); FrameRect(&(*list)->rView); }
+                        if (gSearchList) LUpdate(((GrafPtr)win)->visRgn, gSearchList);
+                        if (gQueueList)  LUpdate(((GrafPtr)win)->visRgn, gQueueList);
                     }
                     EndUpdate(win);
                     break;
@@ -1272,20 +2027,22 @@ int main(void)
                         if (!gSuspended) gLastPoll = 0;
                     }
                     break;
+                case kHighLevelEvent:
+                    AEProcessAppleEvent(&ev);   /* quit + do script (b36) */
+                    break;
                 default:
                     break;
             }
         }
         PollNetwork();
         PumpAux();
-        if (gSearchWin) {   /* blink the search caret */
-            /* IdleControls draws into the CURRENT port, and Redraw() leaves it
-             * on gWindow — without this the caret blinks into the main window
-             * (over the diagnostics) and the search field never gets one. */
+        if (gWindow) {   /* blink the search caret */
+            /* IdleControls draws into the CURRENT port — pin it to the window
+             * or the caret lands wherever the last draw left the port. */
             GrafPtr save;
             GetPort(&save);
-            SetPort((GrafPtr)gSearchWin);
-            IdleControls(gSearchWin);
+            SetPort((GrafPtr)gWindow);
+            IdleControls(gWindow);
             SetPort(save);
         }
 
@@ -1295,7 +2052,8 @@ int main(void)
         }
     }
 
-    StopAudio();
+    StopAudio("quit");
+    if (gLogRef) { DbgLog("quit"); FSClose(gLogRef); gLogRef = 0; }
     if (gTx) { cq_tx_cancel(gTx); cq_tx_free(gTx); }
     cq_now_free(&gSnap);
     FlushEvents(everyEvent, -1);

@@ -31,20 +31,22 @@ resource 'SIZE' (-1) {
     dontGetFrontClicks,
     ignoreChildDiedEvents,
     is32BitCompatible,
-    notHighLevelEventAware,
+    isHighLevelEventAware,       /* b36: Apple Events (quit + do script) so the
+                                    smoke test can drive the app from Script Editor */
     onlyLocalHLEvents,
     notStationeryAware,
     dontUseTextEditServices,
     reserved,
     reserved,
     reserved,
-    1536 * 1024,                 /* preferred: room for the 8-slot cover cache (Fio A) */
-    1024 * 1024                  /* minimum: unchanged from the toolchain default */
+    4096 * 1024,                 /* preferred: cover cache (Fio A) + 1.5 MB audio PCM queue (b23) */
+    2048 * 1024                  /* minimum: must still fit the audio queue */
 };
 
 /* ---- Main document window ---- */
 resource 'WIND' (128, "Casquinha") {
-    { 48, 60, 284, 520 },        /* top, left, bottom, right (236 x 460) */
+    { 48, 60, 538, 520 },        /* top, left, bottom, right (490 x 460):
+                                    player on top, search + queue shelf below (b30) */
     documentProc,
     visible,
     goAway,
@@ -67,14 +69,13 @@ resource 'MENU' (128) {
     }
 };
 
+/* b30: search/queue/listen/wake live IN the main window now — menu tracking
+ * is a synchronous loop that starves the audio ring, so nothing you'd touch
+ * mid-listening belongs in a menu. ⌘F/⌘T/⌘K/⌘U survive as hand-rolled
+ * shortcuts in the keyDown handler. */
 resource 'MENU' (129, "File") {
     129, textMenuProc, allEnabled, enabled, "File",
     {
-        "Search...",       noicon, "F", nomark, plain;
-        "Queue",           noicon, "U", nomark, plain;
-        "Listen / Stop",   noicon, "T", nomark, plain;
-        "Wake gopher-spot",noicon, "K", nomark, plain;
-        "-",               noicon, nokey, nomark, plain;
         "Preferences...",  noicon, ",", nomark, plain;
         "-",               noicon, nokey, nomark, plain;
         "Quit",            noicon, "Q", nomark, plain

@@ -19,7 +19,9 @@ CORE_SRC = \
 	src/cq_debounce.c \
 	src/cq_backoff.c \
 	src/cq_cache.c \
-	src/cq_pls.c
+	src/cq_pls.c \
+	src/cq_mp3.c \
+	src/cq_mp3dec.c
 
 # Transport: the POSIX impl is the host/test one; the Open Transport impl
 # (src/cq_transport_ot.c) is compiled only in the ppc app build (-DCQ_OS9).
@@ -33,6 +35,8 @@ TEST_SRC = \
 	tests/guard_test.c \
 	tests/debounce_test.c \
 	tests/pls_test.c \
+	tests/mp3_test.c \
+	tests/mp3dec_test.c \
 	tests/backoff_test.c \
 	tests/cache_test.c \
 	tests/transport_test.c \
@@ -40,7 +44,7 @@ TEST_SRC = \
 
 FIXTURES = $(CURDIR)/tests/Fixtures
 
-.PHONY: all test probe clean app
+.PHONY: all test probe clean app logtail
 
 all: test
 
@@ -63,6 +67,12 @@ probe: build/probe
 build/probe: $(CORE_SRC) $(NET_SRC) tools/probe.c
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(CORE_SRC) $(NET_SRC) tools/probe.c -o $@
+
+# Live-tail the app's UDP log mirror (b34): every DbgLog line on the VM
+# arrives here as one datagram while you test — no share round-trip.
+# (NOT `nc -kul`: macOS nc latches onto the first sender and drops the rest.)
+logtail:
+	@python3 tools/loglisten.py 5514
 
 clean:
 	rm -rf build Casquinha.app
@@ -90,9 +100,12 @@ app:
 	cd os9/build && PATH="$(RETRO68)/bin:$$PATH" $(MAKE)
 	@echo "built: os9/build/Casquinha.bin (MacBinary PPC app), .dsk (disk image)"
 	@if [ -n "$(SHARE)" ] && [ -d "$(SHARE)" ]; then \
+	  TAG=$$(sed -n 's/.*CQ_BUILD_TAG *"\([^"]*\)".*/\1/p' os9/casquinha.c | head -1); \
 	  rm -f "$(SHARE)/Casquinha.bin" "$(SHARE)/Casquinha.dsk"; \
+	  cp -X os9/build/Casquinha.bin "$(SHARE)/Casquinha-$$TAG.bin"; \
+	  cp -X os9/build/Casquinha.dsk "$(SHARE)/Casquinha-$$TAG.dsk"; \
 	  cp -X os9/build/Casquinha.bin os9/build/Casquinha.dsk "$(SHARE)/"; \
-	  echo "dropped Casquinha.bin + .dsk on $(SHARE) (sha1 $$(shasum -a1 os9/build/Casquinha.bin | cut -c1-12))"; \
+	  echo "dropped Casquinha-$$TAG.bin/.dsk (+ unversioned latest) on $(SHARE) (sha1 $$(shasum -a1 os9/build/Casquinha.bin | cut -c1-12))"; \
 	else \
 	  echo "SHARE not found ($(SHARE)) -- .bin NOT copied"; \
 	fi

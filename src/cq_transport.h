@@ -70,6 +70,40 @@ const char *cq_tx_error_message(const cq_transport *t);
  */
 void cq_tx_cancel(cq_transport *t);
 
+/*
+ * --- Streaming variant (the ⌘T audio wire) ---
+ *
+ * Same connect + "selector\r\n" send, but the response is ENDLESS: status
+ * stays RUNNING for as long as the connection lives (DONE only if the server
+ * closes it), and the outer watchdog is disarmed once bytes are flowing — an
+ * Icecast mount is not a transaction. The caller consumes incrementally with
+ * cq_tx_drain() from its poll loop. The receive buffer is bounded: past
+ * CQ_TX_STREAM_HIWAT the implementation stops reading and lets TCP
+ * backpressure hold the server; draining resumes the reads.
+ */
+#define CQ_TX_STREAM_HIWAT (64 * 1024)
+
+cq_transport *cq_tx_stream_new(const char *host, int port, const char *selector);
+
+/* Move up to cap buffered bytes into dst; returns the count (0 = none right
+ * now). Valid on a streaming transaction in any state — after DONE/FAILED it
+ * drains whatever remains buffered. */
+size_t cq_tx_drain(cq_transport *t, unsigned char *dst, size_t cap);
+
+/*
+ * Fire ONE UDP datagram (the network log mirror — remote-syslog pattern).
+ * Never blocks, never retries, failures are swallowed: logging must not
+ * perturb the thing it observes. The OT implementation only sends once the
+ * transport has already brought Open Transport up (early boot lines stay
+ * file-only); host/POSIX sends immediately. Endpoint and resolved address
+ * are cached after the first call.
+ */
+void cq_tx_udp(const char *host, int port, const void *data, size_t len);
+
+/* Mirror-health counters: datagrams sent OK, failed, and the last OT/errno
+ * error code — so the FILE log can report whether the network mirror works. */
+void cq_tx_udp_stats(long *ok, long *fail, long *lastErr);
+
 void cq_tx_free(cq_transport *t);
 
 #endif /* CQ_TRANSPORT_H */

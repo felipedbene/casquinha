@@ -99,9 +99,94 @@ with Retro68 and on the share, pending the UTM runtime pass.
   to play (`/spot/play?uri=`, fire-and-forget).
 - **Icon.** Classic `ICN#/icl8/ics#/ics8` + `BNDL`/`FREF`/`Casq` signature from
   the otter art (`tools/gen_icons.py`); app built with `CREATOR 'Casq'`.
-- **Audio (⌘T).** QuickTime URL movie from `/spot/stream.pls` (`cq_pls`). **The
-  one unverified piece** — classic-QT Icecast streaming is finicky; needs VM
-  testing, may need a Sound Manager / movie-import fallback.
+- **Audio (⌘T) — VM-VERIFIED (b21).** QuickTime is NOT in the audio path; it
+  cannot play a length-less live stream on OS 9 (QT 5.0.2). The b13–b21 log
+  arc eliminated every QT route: the URL-movie importer parks at
+  `kMovieLoadStateLoading` with 0 tracks forever (idle-import flag included),
+  and SoundConverter assembles chains for BOTH MP3 fourccs ('.mp3',
+  0x6D730055) that consume full-rate input and emit zero PCM, `noErr`,
+  forever — pull (FillBuffer + extended record) and push (ConvertBuffer with
+  exact cq_mp3_walk frame counts) alike. What works, end to end on our own
+  code: `cq_tx_stream` (endless OT read, no watchdog once receiving, 64 KB
+  high-water backpressure, incremental drain) → HTTP header skip → `cq_mp3`
+  confirmed-frame sync → **minimp3** (public domain, vendored
+  `src/minimp3.h`, wrapped in the pure `cq_mp3dec` seam, host-tested against
+  a captured slice of the real mount) → a 1.5 MB PCM ring drained by
+  **SndPlayDoubleBuffer** (b25). The double-back proc at interrupt ONLY reads
+  the ring; the event loop ONLY writes it; a starved ring is served as
+  silence with the buffer still marked ready, so the channel never dies and
+  playback resumes by itself after menus/drags/dialogs. This replaced a
+  bufferCmd + callBackCmd queue whose busy-flag bookkeeping broke under
+  pressure (b24 log: "played" outran wall-clock by 33% — flags cleared
+  early, queued buffers were overwritten, audio chopped and overlapped).
+  Radio physics (b23): a live mount arrives at exactly playback rate, so the
+  cushion never grows on its own — PCM is prebuffered before the first note
+  and capped at a steady-state target; startup latency IS the freeze
+  immunity, and the two knobs (CQ_AUD_PREBUF_PCM / CQ_AUD_RING_TARGET) trade
+  one for the other. b28 ran flawlessly at ~6 s (sil 0 across 3.5 min);
+  b29 dialed to ~2-3 s by preference, the graceful-starvation behavior
+  covering the thinner cushion. The server side (librespot→Icecast) adds a
+  ~1-2 s floor no client knob removes. SIZE: 4 MB / 2 MB.
+  b31 latency lesson: b29's stop-decoding-at-target "cap" didn't cap anything
+  — the backlog parked upstream in staging (4 s) + transport (4 s), invisible
+  and untrimmable: perceived control latency hit ~10 s. Now the decoder
+  always runs (all backlog lives in the measurable ring) and excess beyond
+  target+slack is SKIPPED via a one-shot gRingSkip the interrupt applies —
+  a jump-cut back toward the live edge after freeze/dry-spell catch-ups,
+  race-free because gRingRd keeps a single writer.
+  Mount forensics (tools/mp3scan.c on host captures): the Icecast stream is
+  structurally clean even across wake + NO_ACTIVE_DEVICE + skips — one junk
+  gap at connect, zero mid-stream gaps, zero format flips, 16.0 KB/s wall.
+  The backend's real wart is the wake/transfer STATE dance (wake?play=1 can
+  land paused, /next right after can fail NO_ACTIVE_DEVICE) — gopher-spot
+  territory, not audio corruption.
+- **End-of-track watchdog + visible-queue sequencing (b35/b37/b40).**
+  One-call direct play (`play?uri=`) gives Spotify a single-track context:
+  librespot STOPS at its end instead of pulling the queue (VM-observed:
+  2:20/2:20 frozen, queue full, `/now` said `stopped device active`), the
+  server queue is never consumed by jumps, and from a dead context `/next`
+  no-ops or fails NO_ACTIVE_DEVICE. So the client sequences the VISIBLE
+  queue: `QueueNextRow()` finds the current `track_id` among the rows and
+  the watchdog (playing-near-end → stopped, single-shot, re-armed only by
+  real playback) plays the NEXT row — "from here onward", exactly what the
+  screen shows. The Next button/⌘-key does the same when nothing is playing,
+  and falls back to `/next` during live playback. **b41 goes native**: jumps
+  send the clicked row + continuation as bare ids to the new
+  `/spot/api/1/play/from?ids=…&offset=N` (spec'd from this repo in
+  `design/SPEC-play-from.md`, implemented in gopher-spot) — Spotify gets a
+  real multi-track context and owns advance/next/prev. Feature-detected: an
+  old server answers `not_found` and the client replays the intent as the
+  b40 single-uri play (watchdog + sequencer stay as the fallback/safety
+  net, dormant when native contexts run).
+- **Scriptability + smoke test (b36).** SIZE is now high-level-event aware;
+  the app handles the required Apple Events suite (quit et al.) plus
+  misc/dosc ("do script") with one command string: listen stop play pause
+  next prev wake add search:<q> — each logged as `apple-event: ...`, so a
+  scripted run narrates itself in the per-build log. Two AppleScripts ship
+  in `tools/` (and on the share as MacRoman/CR .txt for Script Editor):
+  "Test Casquinha" drives launch→listen→search→add→next→wake→stop→quit with
+  paced delays, and "Collect Logs" has the Finder copy every
+  `Casquinha b*.log` onto the AFP share.
+- **One-window UI (b30).** Menu tracking is a synchronous loop that starves
+  the audio ring, so nothing you'd touch mid-listening lives in a menu
+  anymore: search (field + results list), the queue list, Add to Queue, the
+  Listen⇄Stop toggle and Wake are all IN the main window (460×490 — player
+  on top, shelf below). The separate Search/Queue windows are gone; the File
+  menu is just Preferences/Quit; ⌘F/⌘T/⌘K/⌘U survive as hand-rolled
+  shortcuts. The 2 Hz diagnostics animator repaints ONLY the player area
+  (above CQ_SHELF_TOP) — erasing the shelf would blank the List Manager
+  lists twice a second. The queue poll is permanent now (list always
+  visible): cadence halved to 10 s per the exhaustion discipline, with the
+  post-command kick (Fio H) keeping adds feeling immediate.
+  minimp3 wants ~15 KB of stack: `SetApplLimit` carves headroom before
+  `MaxApplZone`. Steady state on the VM: ~3.8 bufs/s (= 1.0 s audio/s),
+  4 in flight, zero underruns; the mount starves briefly between tracks
+  (librespot feeds Icecast only while playing) and the engine rides it out.
+  Debug harness: `DbgLog` → `Casquinha <tag>.log` next to the app (one log
+  PER BUILD, b32 — a session can't be misread against the wrong binary),
+  flushed per line, round-tripped over the AFP share. The share drops are
+  versioned too: `make app` copies `Casquinha-<tag>.bin/.dsk` alongside the
+  unversioned latest.
 - **Fio A (exhaustion audit, b8) — cover fail-once + tried-set.** New pure
   module `cq_cache` (fixed-slot FIFO, NULL value = "tried, no image"): every
   /cover outcome is remembered, so a failing fetch is no longer retried every
