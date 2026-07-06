@@ -167,6 +167,12 @@ with Retro68 and on the share, pending the UTM runtime pass.
   "Test Casquinha" drives launch→listen→search→add→next→wake→stop→quit with
   paced delays, and "Collect Logs" has the Finder copy every
   `Casquinha b*.log` onto the AFP share.
+- **Player-aware audio status (b49).** "Paused … on air" side by side read
+  as stale (the tail really is audible ~3 s — radio latency — but it looks
+  wrong). When the player isn't playing, the readout follows the physics:
+  "playing out..." while the ring's tail drains, then "standing by" (tuned,
+  silent transmitter); "waiting for Spotify..." is reserved for the true
+  anomaly (state playing, rx dry).
 - **Command ack + radio vocabulary (b48).** Clicking Next showed nothing
   for up to ~7 s (debounce + poll flip + radio latency) — now "Skipping..."
   replaces the state word the instant the click lands, cleared when the

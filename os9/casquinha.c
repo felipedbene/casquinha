@@ -72,7 +72,7 @@ enum {
     kQuitItem    = 3     /* Preferences, -, Quit */
 };
 
-#define CQ_BUILD_TAG "b48"  /* bump on every VM-iteration build (see status row,
+#define CQ_BUILD_TAG "b49"  /* bump on every VM-iteration build (see status row,
                              * the share filenames, and the per-build log name) */
 #define CQ_DEFAULT_HOST "10.0.100.112"  /* server address is a pref (Fio 6) */
 #define CQ_DEFAULT_PORT 70
@@ -1641,8 +1641,17 @@ static void AudioStatusStr(char *out, size_t cap)
                           (unsigned long)CQ_AUD_PREBUF_PCM);
         if (pct > 99) pct = 99;
         snprintf(out, cap, "buffering... %ld%%", pct);
+    } else if (gSnap.state != CQ_STATE_PLAYING) {
+        /* upstream paused/stopped: "Paused ... on air" side by side read as
+         * a stale status (b49 field laugh). The truth in radio-speak: the
+         * ring's tail is still audible for ~3 s (radio latency), then we
+         * are tuned to a silent transmitter. */
+        if (gRingWr - gRingRd > (unsigned long)CQ_AUD_CHUNK)
+            snprintf(out, cap, "playing out...");
+        else
+            snprintf(out, cap, "standing by");
     } else if (gMountDry) {
-        snprintf(out, cap, "waiting for Spotify...");
+        snprintf(out, cap, "waiting for Spotify...");   /* playing, yet rx dry: anomaly */
     } else if ((long)((unsigned long)TickCount() - gStarveUntil) < 0) {
         snprintf(out, cap, "buffering...");
     } else {
