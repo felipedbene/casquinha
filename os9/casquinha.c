@@ -77,7 +77,7 @@ enum {
     kQuitItem    = 3     /* Preferences, -, Quit */
 };
 
-#define CQ_BUILD_TAG "b57"  /* bump on every VM-iteration build (see status row,
+#define CQ_BUILD_TAG "b58"  /* bump on every VM-iteration build (see status row,
                              * the share filenames, and the per-build log name) */
 #define CQ_DEFAULT_HOST "10.0.100.112"  /* server address is a pref (Fio 6) */
 #define CQ_DEFAULT_PORT 70
@@ -1368,14 +1368,26 @@ static void QueueSelected(void)
     Cell c;
     char euri[128], sel[192];
     size_t li = 0;
+    cq_row_kind k;
     SetPt(&c, 0, 0);
     if (!gSearchList || !LGetSelect(true, &c, gSearchList)) return;
-    /* Only a track row queues (b57): artist/album rows have no single uri. */
-    if (ResultKindAt(c.v, &li) != CQ_ROW_TRACK) return;
-    if (li >= gSearchItems.count || !gSearchItems.items[li].uri) return;
-    EscInto(gSearchItems.items[li].uri, euri, sizeof(euri), 1);   /* keep the colons */
-    snprintf(sel, sizeof(sel), "/spot/api/1/queue/add?%s", euri);
-    StartFire(sel);
+    /* b57: a track row enqueues its one uri (queue/add); an ALBUM row enqueues
+     * the whole album onto up-next (queue/album — the server expands it, since
+     * Spotify's queue takes one uri at a time). Artist/back rows: nothing. */
+    k = ResultKindAt(c.v, &li);
+    if (k == CQ_ROW_TRACK) {
+        if (li >= gSearchItems.count || !gSearchItems.items[li].uri) return;
+        EscInto(gSearchItems.items[li].uri, euri, sizeof(euri), 1);   /* keep the colons */
+        snprintf(sel, sizeof(sel), "/spot/api/1/queue/add?%s", euri);
+        StartFire(sel);
+    } else if (k == CQ_ROW_ALBUM) {
+        cq_ref_list *src = gAlbumBrowse ? &gArtistAlbums : &gSearchAlbums;
+        if (li >= src->count || !src->items[li].id) return;
+        /* album ids are base62 (no escaping needed); server re-gates the id */
+        snprintf(sel, sizeof(sel), "/spot/api/1/queue/album?id=%s", src->items[li].id);
+        StartFire(sel);
+        DbgLog("queue/album: %s", src->items[li].id);
+    }
 }
 
 /* --- audio: live Icecast MP3 — OUR wire, QuickTime as codec only (b16) -----
