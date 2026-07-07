@@ -39,8 +39,9 @@ resource 'SIZE' (-1) {
     reserved,
     reserved,
     reserved,
-    4096 * 1024,                 /* preferred: cover cache (Fio A) + 1.5 MB audio PCM queue (b23) */
-    2048 * 1024                  /* minimum: must still fit the audio queue */
+    5120 * 1024,                 /* preferred: cover cache (Fio A) + 2 MB PCM ring
+                                    + 256 KB comp ring (b53 deep cushion) */
+    3072 * 1024                  /* minimum: must still fit both audio rings */
 };
 
 /* ---- Main document window ---- */

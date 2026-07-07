@@ -75,7 +75,7 @@ enum {
     kQuitItem    = 3     /* Preferences, -, Quit */
 };
 
-#define CQ_BUILD_TAG "b52"  /* bump on every VM-iteration build (see status row,
+#define CQ_BUILD_TAG "b53"  /* bump on every VM-iteration build (see status row,
                              * the share filenames, and the per-build log name) */
 #define CQ_DEFAULT_HOST "10.0.100.112"  /* server address is a pref (Fio 6) */
 #define CQ_DEFAULT_PORT 70
@@ -540,6 +540,8 @@ static void UpdatePlayTitle(void)
 }
 
 static void StartCommand(const char *sel);   /* defined with the transport glue */
+static void TrimToLive(void);                /* b53 live-cut; defined with the
+                                                audio engine */
 static void PlayItem(cq_track_list *items, int row);   /* search/queue section */
 static void PlayFrom(cq_track_list *items, int row, cq_track_list *cont);
 static void StartFire(const char *sel);
@@ -769,7 +771,12 @@ static void StartCommand(const char *sel)
 {
     if (gCmd) return;
     gCmd = cq_tx_new(gHost, gPort, sel);
-    if (gCmd) cq_tx_start(gCmd);
+    if (gCmd) {
+        cq_tx_start(gCmd);
+        TrimToLive();   /* b53: every transport command rides this channel —
+                           jump the radio toward the live edge so the change
+                           reaches the ear fast despite the deep cushion */
+    }
 }
 
 /* Decode JPEG cover bytes into a 64x64 GWorld via QuickTime's GraphicsImporter.
@@ -1101,6 +1108,8 @@ static void PlayItem(cq_track_list *items, int row)
     EscInto(items->items[row].uri, euri, sizeof(euri), 1);   /* keep the colons */
     snprintf(sel, sizeof(sel), "/spot/play?uri=%s", euri);
     StartFire(sel);
+    TrimToLive();   /* b53: a jump-to-track is a transport command too (its
+                       sibling queue/add is NOT — no audible change to chase) */
 }
 
 /* Native "from here onward" (b41, design/SPEC-play-from.md): send bare track
@@ -1209,11 +1218,12 @@ typedef enum { AU_IDLE = 0, AU_HTTP, AU_SYNC, AU_PLAY } au_state;
  * Radio physics (b23): a live mount arrives at exactly playback rate, so the
  * cushion never grows on its own — it is BUILT, up front: ~5 s of decoded
  * PCM before the first note. Startup latency IS the freeze immunity. */
-#define CQ_AUD_RING_BYTES (1536L * 1024L)  /* ~8.7 s of 44.1 kHz stereo 16-bit */
+#define CQ_AUD_RING_BYTES (2048L * 1024L)  /* ~11.9 s of 44.1 kHz stereo 16-bit */
 #define CQ_AUD_CHUNK      (32L * 1024L)    /* per double-buffer refill (~0.19 s) */
-/* Latency knobs (b29/b31): the backlog IS both the command→ear delay and the
- * freeze/dry-spell immunity — one buys the other. The server side
- * (librespot→Icecast) adds its own ~1-2 s floor that no client knob removes.
+/* Latency knobs (b29/b31, repriced in b53): the backlog IS both the
+ * command→ear delay and the freeze/dry-spell immunity — one buys the other.
+ * The server side (librespot→Icecast) adds its own ~1-2 s floor that no
+ * client knob removes.
  *
  * b31 lesson: b29's "stop decoding at the target" cap did NOT cap latency —
  * the backlog just moved upstream into the staging (4 s) and transport (4 s)
@@ -1221,11 +1231,24 @@ typedef enum { AU_IDLE = 0, AU_HTTP, AU_SYNC, AU_PLAY } au_state;
  * runs (the whole backlog lives IN the ring, where it can be measured) and
  * excess beyond target+slack is SKIPPED — a one-shot jump-cut back toward
  * the live edge, applied by the interrupt so the read cursor has exactly one
- * writer. Normal fill (~prebuffer) sits below the trim threshold, so trims
- * only fire after freeze/dry-spell catch-ups. */
+ * writer.
+ *
+ * b53 repricing: with the decoder preemptive (b52), a deep standing backlog
+ * finally WORKS as freeze immunity — so we keep it (target ~7.4 s; the
+ * standing trim is now just a near-full guard), and pay the latency only at
+ * the moment it matters: a transport command (Next/Prev/Play…) fires a
+ * LIVE-CUT, the same one-shot skip, down to CQ_AUD_CMD_TARGET. Continuous
+ * listening survives menus and drags; your click still reaches the ear in
+ * ~3 s. The deep cushion itself must arrive at connect — the Icecast burst
+ * (design/SPEC-burst.md asks gopher-spot for ~256 KB). */
 #define CQ_AUD_PREBUF_PCM  (384L * 1024L)  /* ~2.2 s decoded before starting */
-#define CQ_AUD_RING_TARGET (512L * 1024L)  /* trim back to ~2.9 s of backlog */
+#define CQ_AUD_RING_TARGET (1280L * 1024L) /* keep ~7.4 s: the freeze cushion */
 #define CQ_AUD_TRIM_SLACK  (256L * 1024L)  /* +1.5 s hysteresis before trimming */
+#define CQ_AUD_CMD_TARGET  (384L * 1024L)  /* live-cut leaves ~2.2 s — the launch
+                                              cushion; it does NOT regrow (a live
+                                              mount arrives at playback rate), so
+                                              a command spends the connection's
+                                              burst until the next reconnect */
 #define CQ_AUD_COMP_MAX   (64 * 1024)      /* pre-play staging (header strip + sync) */
 #define CQ_AUD_COMP_RING  (256L * 1024L)   /* compressed SPSC ring feeding the
                                               decode pipeline (cq_decring, b51) —
@@ -1261,6 +1284,8 @@ static volatile long  gRingSkip = 0;              /* one-shot latency trim reque
                                                     interrupt applies + zeroes it —
                                                     gRingRd keeps a single writer */
 static long           gTrims = 0;                 /* trims this listen */
+static unsigned long  gCutPending = 0;            /* b53 live-cut armed at this tick
+                                                     (0 = none); main-only state */
 static unsigned long  gStarveUntil = 0;           /* show "Buffering" until this tick */
 static int            gMountDry = 0;              /* rx parked >3 s while playing */
 static unsigned long  gAuBeat = 0;                /* heartbeat log tick */
@@ -1483,6 +1508,7 @@ static void StopAudio(const char *why)
     gPlaying = 0;
     gRingWr = gRingRd = 0;
     gRingSkip = 0;
+    gCutPending = 0;
     gStarveUntil = 0;
     gMountDry = 0;
 }
@@ -1585,6 +1611,17 @@ static void DrainStreamToDec(void)
         if (gRxTotal <= 12288)
             DbgLog("audio: rx +%ld (total %ld)", (long)n, gRxTotal);
     }
+}
+
+/* b53 live-cut, phase 1: a transport command just left for the wire. The deep
+ * ring backlog (freeze immunity) is now pure command→ear delay — but the cut
+ * itself is DEFERRED to ServiceAudio: right after a freeze the backlog may
+ * still sit compressed in the comp ring/stage, where gRingSkip can't reach
+ * it; let the pump (10x realtime) turn it into PCM first, then cut once. */
+static void TrimToLive(void)
+{
+    if (gAuSt != AU_PLAY || !gPlaying || gCutPending) return;
+    gCutPending = (unsigned long)TickCount() | 1;   /* |1: tick 0 still arms */
 }
 
 /* Advance the whole audio pipeline one bounded slice; never blocks. */
@@ -1703,6 +1740,24 @@ static void ServiceAudio(void)
             if (gDec.flushes != gDecFluSeen) {
                 gDecFluSeen = gDec.flushes;
                 DbgLog("audio: staging unparseable, flushed (x%ld)", gDec.flushes);
+            }
+        }
+        if (gCutPending) {   /* b53 live-cut, phase 2: once the compressed tail
+                              * has decoded (or ~2 s passed), skip the PCM
+                              * backlog in one interrupt-applied cut */
+            unsigned long backlog = gDec.comp_wr - gDec.comp_rd + gDec.stage_len;
+            if (backlog < 4096 ||
+                (long)((unsigned long)TickCount() - gCutPending) > 120) {
+                if (gRingSkip == 0) {
+                    unsigned long fill = gRingWr - gRingRd;
+                    if (fill > (unsigned long)(CQ_AUD_CMD_TARGET + CQ_AUD_CHUNK)) {
+                        gRingSkip = (long)(fill - CQ_AUD_CMD_TARGET);
+                        gTrims++;
+                        DbgLog("audio: live-cut, skipping %ld KB (command)",
+                               (long)((fill - CQ_AUD_CMD_TARGET) / 1024));
+                    }
+                    gCutPending = 0;
+                }   /* else a trim is in flight; retry next pass */
             }
         }
         if (!gPlaying) {
