@@ -28,6 +28,7 @@ void codec_tests(void);
 void now_tests(void);
 void track_tests(void);
 void guard_tests(void);
+void view_tests(void);
 void debounce_tests(void);
 void pls_tests(void);
 void mp3_tests(void);

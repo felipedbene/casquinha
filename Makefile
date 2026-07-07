@@ -16,6 +16,7 @@ CORE_SRC = \
 	src/cq_now.c \
 	src/cq_track.c \
 	src/cq_guard.c \
+	src/cq_view.c \
 	src/cq_debounce.c \
 	src/cq_backoff.c \
 	src/cq_cache.c \
@@ -34,6 +35,7 @@ TEST_SRC = \
 	tests/now_test.c \
 	tests/track_test.c \
 	tests/guard_test.c \
+	tests/view_test.c \
 	tests/debounce_test.c \
 	tests/pls_test.c \
 	tests/mp3_test.c \

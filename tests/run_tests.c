@@ -17,6 +17,7 @@ int main(void)
     now_tests();
     track_tests();
     guard_tests();
+    view_tests();
     debounce_tests();
     pls_tests();
     mp3_tests();
