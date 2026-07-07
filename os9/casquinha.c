@@ -40,6 +40,8 @@
 #include <Gestalt.h>
 #include <AppleEvents.h>
 #include <AERegistry.h>
+#include <Multiprocessing.h>
+#include <DriverServices.h>
 
 #include <string.h>
 #include <stdio.h>
@@ -56,6 +58,7 @@
 #include "cq_pls.h"
 #include "cq_mp3.h"
 #include "cq_mp3dec.h"
+#include "cq_decring.h"
 #include "cq_transport.h"
 
 enum {
@@ -72,7 +75,7 @@ enum {
     kQuitItem    = 3     /* Preferences, -, Quit */
 };
 
-#define CQ_BUILD_TAG "b49"  /* bump on every VM-iteration build (see status row,
+#define CQ_BUILD_TAG "b51"  /* bump on every VM-iteration build (see status row,
                              * the share filenames, and the per-build log name) */
 #define CQ_DEFAULT_HOST "10.0.100.112"  /* server address is a pref (Fio 6) */
 #define CQ_DEFAULT_PORT 70
@@ -107,7 +110,6 @@ static int           gLastStat  = -1;    /* last cq_tx_status seen */
 static int           gLastErr   = 0;     /* last cq_tx_error code */
 static long          gLastLen   = 0;     /* bytes of last reply */
 static char          gLastMsg[128] = "";
-static unsigned long gLastDraw  = 0;
 
 /* Audio status line (b45) — defined with the audio engine, drawn in the
  * player's status row so the silent phases (tuning/prebuffer/dry mount)
@@ -1224,13 +1226,25 @@ typedef enum { AU_IDLE = 0, AU_HTTP, AU_SYNC, AU_PLAY } au_state;
 #define CQ_AUD_PREBUF_PCM  (384L * 1024L)  /* ~2.2 s decoded before starting */
 #define CQ_AUD_RING_TARGET (512L * 1024L)  /* trim back to ~2.9 s of backlog */
 #define CQ_AUD_TRIM_SLACK  (256L * 1024L)  /* +1.5 s hysteresis before trimming */
-#define CQ_AUD_COMP_MAX   (64 * 1024)      /* compressed staging (decode workspace) */
+#define CQ_AUD_COMP_MAX   (64 * 1024)      /* pre-play staging (header strip + sync) */
+#define CQ_AUD_COMP_RING  (256L * 1024L)   /* compressed SPSC ring feeding the
+                                              decode pipeline (cq_decring, b51) —
+                                              ~16 s of 128 kbps ahead of the stage */
 
 static cq_transport  *gPls    = NULL;   /* /spot/stream.pls discovery */
 static cq_transport  *gStream = NULL;   /* the endless Icecast connection */
 static au_state       gAuSt   = AU_IDLE;
-static unsigned char  gComp[CQ_AUD_COMP_MAX];   /* compressed staging */
+static unsigned char  gComp[CQ_AUD_COMP_MAX];   /* pre-play staging: gStream drains
+                                                   here through AU_HTTP/AU_SYNC; at
+                                                   AU_PLAY the remainder hands off to
+                                                   gDec and this buffer goes quiet */
 static size_t         gCompLen = 0;
+static Ptr            gCompRing = NULL;         /* comp SPSC ring, NewPtr'd with gRing */
+static cq_decring     gDec;                     /* the decode pipeline (cq_decring.h):
+                                                   b51 pumps it inline on the loop,
+                                                   b52 moves the pump to an MP task */
+static long           gDecResSeen = 0;          /* pump counters already narrated */
+static long           gDecFluSeen = 0;
 static cq_mp3_frame   gFmt;             /* from the first confirmed frame */
 static SndChannelPtr  gChan = NULL;
 static Ptr            gRing = NULL;               /* PCM ring, NewPtr'd on first listen */
@@ -1247,9 +1261,6 @@ static volatile long  gRingSkip = 0;              /* one-shot latency trim reque
                                                     interrupt applies + zeroes it —
                                                     gRingRd keeps a single writer */
 static long           gTrims = 0;                 /* trims this listen */
-static long           gPcmTotal = 0;              /* PCM bytes decoded this listen */
-static long           gDecTicks = 0;              /* ticks spent inside the decoder */
-static long           gDecFrames = 0;             /* frames decoded this listen */
 static unsigned long  gStarveUntil = 0;           /* show "Buffering" until this tick */
 static int            gMountDry = 0;              /* rx parked >3 s while playing */
 static unsigned long  gAuBeat = 0;                /* heartbeat log tick */
@@ -1293,7 +1304,8 @@ static int ParseHttpUrl(const char *url, char *host, size_t hcap,
  * ring. Only reads gRingRd/gRingWr and the ring bytes; a starved ring is
  * served as silence with the buffer still marked ready, so the channel
  * keeps running and playback resumes on its own. No Memory Manager, no
- * Toolbox, just copies. */
+ * Toolbox, just copies. (The PCM producer behind gRingWr may become an MP
+ * task in b52 — same SPSC contract, nothing changes on this side.) */
 static pascal void AudioDoubleBack(SndChannelPtr chan, SndDoubleBufferPtr db)
 {
     unsigned long avail;
@@ -1339,6 +1351,9 @@ static void StopAudio(const char *why)
     if (gAuSt != AU_IDLE) DbgLog("audio: stopped (%s)", why);
     gAuSt = AU_IDLE;
     gCompLen = 0;
+    cq_decring_reset(&gDec);   /* b51: the pump runs on this loop, so resetting
+                                * here can't race it. b52 MUST park the MP task
+                                * (gDecCmd/gDecAck handshake) before this line. */
     gPlaying = 0;
     gRingWr = gRingRd = 0;
     gRingSkip = 0;
@@ -1351,18 +1366,32 @@ static void StopAudio(const char *why)
  * proved every QT route (URL movie, SoundConverter pull/push, both MP3
  * fourccs) consumes the stream and decodes nothing on QT 5.0.2. The channel
  * itself starts later, once the prebuffer is in the ring. */
+/* The pump's clock (cq_decring's injected now hook). b51: the pump runs on
+ * the event loop, so TickCount is legal and dec_time stays in ticks like the
+ * old gDecTicks. b52 swaps in an UpTime wrapper for the MP task (TickCount is
+ * a trap — illegal off the main context). */
+static unsigned long long DecNowTicks(void)
+{
+    return (unsigned long long)TickCount();
+}
+
 static int OpenAudioOutput(void)
 {
     if (!gRing) gRing = NewPtr(CQ_AUD_RING_BYTES);
     if (!gRing) { DbgLog("audio: NewPtr(ring %ld) failed", CQ_AUD_RING_BYTES); return 0; }
-    cq_mp3dec_init();
+    if (!gCompRing) gCompRing = NewPtr(CQ_AUD_COMP_RING);
+    if (!gCompRing) { DbgLog("audio: NewPtr(comp %ld) failed", CQ_AUD_COMP_RING); return 0; }
     gRingWr = gRingRd = 0;
+    cq_decring_init(&gDec, (unsigned char *)gCompRing, CQ_AUD_COMP_RING,
+                    (unsigned char *)gRing, CQ_AUD_RING_BYTES,
+                    &gRingWr, &gRingRd);
+    gDec.now = DecNowTicks;
+    gDecResSeen = gDecFluSeen = 0;
+    cq_mp3dec_init();
     gPlaying = 0;
     gDBFires = gDBSilence = 0;
     gRingSkip = 0;
     gTrims = 0;
-    gPcmTotal = 0;
-    gDecTicks = gDecFrames = 0;
     DbgLog("audio: output armed (minimp3), %d Hz %dch %d kbps",
            gFmt.samplerate, gFmt.channels, gFmt.bitrate_kbps);
     return 1;
@@ -1405,90 +1434,26 @@ static int StartDoubleBuffer(void)
     return 1;
 }
 
-/* Decode staged MP3 into the PCM ring (one frame per iteration, wrap-aware),
- * and start the double-buffer engine once the prebuffer is in. The decoder
- * skips junk itself; a consumed count of 0 means "partial frame tail — wait
- * for more bytes". Host-verified against a captured slice of this very
- * stream (tests/mp3dec_test.c). */
-static void PumpRing(void)
+/* The decode step itself — staging, the b26 tail-gate, the b27 resync, the
+ * minimp3 call, the wrap-aware ring write — moved verbatim to the portable
+ * pipeline in src/cq_decring.c (b51), where the host suite proves it
+ * byte-identical to a flat decode. Here remains only the wire-side feeder:
+ * drain the Icecast socket straight into the comp ring, zero-copy. */
+static void DrainStreamToDec(void)
 {
-    static short tmp[CQ_MP3DEC_MAX_SAMPLES];   /* one decoded frame, bounced
-                                                 into the ring with wrap */
-    size_t used = 0;
-
     for (;;) {
-        unsigned long space = CQ_AUD_RING_BYTES - (gRingWr - gRingRd);
-        int consumed = 0, fch = 0, fhz = 0, s;
-        /* NO latency gate here (b31): pausing the decoder just parks the
-         * backlog upstream in staging + transport where it can't be trimmed.
-         * Decode everything; the trim in ServiceAudio bounds the latency. */
-        if (space < (unsigned long)(CQ_MP3DEC_MAX_SAMPLES * 2)) break;  /* ring full */
-        if (used >= gCompLen) break;                                    /* staging dry */
-        {   /* NEVER feed the decoder an unconfirmed tail: minimp3 treats a
-             * final frame it cannot verify against the NEXT header as junk
-             * and EATS it silently (b26: ~40% of the input vanished this
-             * way, sil 138/207 fires). Hold the tail until its successor is
-             * fully staged; a dead stream flushes its true last frame. */
-            int wf = 0;
-            cq_mp3_walk(gComp + used, gCompLen - used, 2, &wf);
-            if (wf < (gStream ? 2 : 1)) {
-                /* Gate failing at the HEAD with a deep staging = junk from a
-                 * mid-stream splice, and the gate is blocking the very
-                 * resync that would skip it — b27 session 1 deadlocked here
-                 * for 20 s (staging full, rx frozen, ring starved). Realign
-                 * explicitly and drop the prefix. */
-                if (gCompLen - used > 8192) {
-                    cq_mp3_frame nf;
-                    long off = cq_mp3_sync(gComp + used, gCompLen - used, &nf);
-                    if (off > 0) {
-                        DbgLog("audio: resync +%ld (splice junk dropped)", off);
-                        used += (size_t)off;
-                        continue;
-                    }
-                    if (off < 0) {
-                        DbgLog("audio: staging unparseable, flushing %ld B",
-                               (long)(gCompLen - used));
-                        used = gCompLen;
-                    }
-                }
-                break;
-            }
-        }
-        {   /* decode-throughput probe: 60 Hz ticks integrated over many
-             * frames tell whether minimp3 keeps up with realtime (38 fps) */
-            unsigned long t0 = (unsigned long)TickCount();
-            s = cq_mp3dec_frame(gComp + used, gCompLen - used, tmp,
-                                &fch, &fhz, &consumed);
-            gDecTicks += (long)((unsigned long)TickCount() - t0);
-        }
-        if (consumed <= 0) break;                  /* partial tail: need bytes */
-        used += (size_t)consumed;
-        if (s <= 0) continue;                      /* junk skipped */
-        gDecFrames++;
-        {
-            long bytes = (long)s * fch * 2;
-            unsigned long wr = gRingWr % CQ_AUD_RING_BYTES;
-            long first = (long)(CQ_AUD_RING_BYTES - wr);
-            if (first > bytes) first = bytes;
-            memcpy(gRing + wr, tmp, (size_t)first);
-            if (bytes > first)
-                memcpy(gRing, (char *)tmp + first, (size_t)(bytes - first));
-            gRingWr += (unsigned long)bytes;
-            gPcmTotal += bytes;
-        }
-    }
-    if (used) {
-        gCompLen -= used;
-        if (gCompLen) memmove(gComp, gComp + used, gCompLen);
-    }
-
-    if (!gPlaying) {
-        unsigned long fill = gRingWr - gRingRd;
-        /* start at the prebuffer mark — or with whatever remains if the
-         * stream already died (play the tail out rather than sit on it) */
-        if (fill >= (unsigned long)CQ_AUD_PREBUF_PCM || (!gStream && fill > 0)) {
-            if (!StartDoubleBuffer()) StopAudio("output start failed");
-        }
+        unsigned long contig = 0;
+        unsigned char *dst = cq_decring_claim(&gDec, &contig);
+        size_t n;
+        if (!contig) break;                    /* comp ring full: backpressure */
+        n = cq_tx_drain(gStream, dst, (size_t)contig);
+        if (!n) break;
+        cq_decring_commit(&gDec, (unsigned long)n);
+        gRxTotal += (long)n;
+        /* The first ~12 KB, drain by drain: an impatience-proof rate read.
+         * (VM tests keep getting toggled off within seconds — b16/b17.) */
+        if (gRxTotal <= 12288)
+            DbgLog("audio: rx +%ld (total %ld)", (long)n, gRxTotal);
     }
 }
 
@@ -1497,10 +1462,14 @@ static void ServiceAudio(void)
 {
     if (gAuSt == AU_IDLE) return;
 
-    /* 1) the wire: poll, drain into staging, note death */
+    /* 1) the wire: poll, drain, note death. Pre-play the bytes stage in gComp
+     * (header strip + sync need a flat window); once playing they feed the
+     * comp ring, whose backpressure replaces the old staging-full check. */
     if (gStream) {
         cq_tx_status st = cq_tx_poll(gStream);
-        if (gCompLen < sizeof(gComp)) {
+        if (gAuSt == AU_PLAY) {
+            DrainStreamToDec();
+        } else if (gCompLen < sizeof(gComp)) {
             size_t n = cq_tx_drain(gStream, gComp + gCompLen, sizeof(gComp) - gCompLen);
             gCompLen += n;
             gRxTotal += (long)n;
@@ -1512,10 +1481,18 @@ static void ServiceAudio(void)
         if (st != CQ_TX_RUNNING) {
             DbgLog("audio: stream %s", st == CQ_TX_DONE ? "closed by server"
                                                         : cq_tx_error_message(gStream));
-            if (gCompLen < sizeof(gComp))       /* last drain of the buffered tail */
-                gCompLen += cq_tx_drain(gStream, gComp + gCompLen, sizeof(gComp) - gCompLen);
-            cq_tx_free(gStream); gStream = NULL;
-            if (gAuSt != AU_PLAY) { StopAudio("stream died before playback"); return; }
+            if (gAuSt == AU_PLAY) {
+                DrainStreamToDec();             /* last drain of the buffered tail */
+                cq_tx_free(gStream); gStream = NULL;
+                cq_decring_eof(&gDec);          /* let the pump flush the held
+                                                   final frame (b26 gate 2 -> 1) */
+            } else {
+                if (gCompLen < sizeof(gComp))   /* last drain of the buffered tail */
+                    gCompLen += cq_tx_drain(gStream, gComp + gCompLen, sizeof(gComp) - gCompLen);
+                cq_tx_free(gStream); gStream = NULL;
+                StopAudio("stream died before playback");
+                return;
+            }
         }
     }
 
@@ -1555,16 +1532,53 @@ static void ServiceAudio(void)
             memmove(gComp, gComp + off, gCompLen);
             if (!OpenAudioOutput()) { StopAudio("output open failed"); return; }
             gAuSt = AU_PLAY;
+            {   /* hand the synced remainder to the decode pipeline; the comp
+                 * ring (256 KB) dwarfs this staging (64 KB), so it all fits */
+                size_t done = 0;
+                while (done < gCompLen) {
+                    unsigned long contig = 0;
+                    unsigned char *dst = cq_decring_claim(&gDec, &contig);
+                    if (!contig) break;
+                    if ((size_t)contig > gCompLen - done)
+                        contig = (unsigned long)(gCompLen - done);
+                    memcpy(dst, gComp + done, (size_t)contig);
+                    cq_decring_commit(&gDec, contig);
+                    done += (size_t)contig;
+                }
+                gCompLen = 0;
+            }
         } else if (gCompLen > 32 * 1024) {
             StopAudio("no MP3 frame in 32 KB");
             return;
         }
     }
 
-    /* 4) playback: decode into the ring; drained-out = done */
+    /* 4) playback: pump the decode pipeline; drained-out = done. b51 pumps
+     * inline (same behavior as ever); b52 moves this call to the MP task. */
     if (gAuSt == AU_PLAY) {
-        PumpRing();
-        if (gAuSt != AU_PLAY) return;   /* the pump may give up and stop */
+        cq_decring_pump(&gDec);
+        {   /* narrate the pump's mailbox (the module may not DbgLog — it has
+             * to stay legal on an MP task) */
+            if (gDec.resyncs != gDecResSeen) {
+                gDecResSeen = gDec.resyncs;
+                DbgLog("audio: resync x%ld (%ld B splice junk dropped)",
+                       gDec.resyncs, gDec.resync_bytes);
+            }
+            if (gDec.flushes != gDecFluSeen) {
+                gDecFluSeen = gDec.flushes;
+                DbgLog("audio: staging unparseable, flushed (x%ld)", gDec.flushes);
+            }
+        }
+        if (!gPlaying) {
+            unsigned long fill = gRingWr - gRingRd;
+            /* start at the prebuffer mark — or with whatever remains if the
+             * stream already died (play the tail out rather than sit on it).
+             * SndPlayDoubleBuffer is Toolbox: this decision stays on main. */
+            if (fill >= (unsigned long)CQ_AUD_PREBUF_PCM || (!gStream && fill > 0)) {
+                if (!StartDoubleBuffer()) StopAudio("output start failed");
+            }
+        }
+        if (gAuSt != AU_PLAY) return;   /* the start may give up and stop */
         {   /* status tells (b45): starvation (interrupt served silence) and
              * a dry mount (rx parked while playing = Spotify isn't sending;
              * the right lever is Play/Wake, not Listen). */
@@ -1596,7 +1610,7 @@ static void ServiceAudio(void)
                        (long)((fill - CQ_AUD_RING_TARGET) / 1024));
             }
         }
-        if (!gStream && gCompLen == 0 && gPlaying && gRingWr == gRingRd) {
+        if (!gStream && cq_decring_idle(&gDec) && gPlaying && gRingWr == gRingRd) {
             StopAudio("played out");
             return;
         }
@@ -1616,9 +1630,10 @@ static void ServiceAudio(void)
                 cq_tx_udp_stats(&uok, &ufail, &uerr);
                 DbgLog("audio: playing, ring %ld KB, fires %ld, sil %ld, trims %ld, dec %ldf/%ldt, pcm %ldK, %ld staged, %ld rx, udp %ld/%ld e%ld",
                        (long)((gRingWr - gRingRd) / 1024),
-                       gDBFires, gDBSilence, gTrims, gDecFrames, gDecTicks,
-                       gPcmTotal / 1024, (long)gCompLen, gRxTotal,
-                       uok, ufail, uerr);
+                       gDBFires, gDBSilence, gTrims, gDec.frames,
+                       (long)gDec.dec_time, gDec.pcm_total / 1024,
+                       (long)(gDec.comp_wr - gDec.comp_rd + gDec.stage_len),
+                       gRxTotal, uok, ufail, uerr);
             }
         }
     } else if ((unsigned long)TickCount() - gAuBeat >= 300) {   /* pre-play: ~5 s */
@@ -2068,6 +2083,190 @@ static void DoMouseDown(EventRecord *ev)
     }
 }
 
+/* --- MP smoke probe (b50, exp/mp-decode phase 0) ------------------------
+ * Before any audio surgery: prove Multiprocessing Services schedules a
+ * preemptive task under UTM/QEMU OS 9 — INCLUDING while the cooperative
+ * loop is frozen inside MenuSelect. The task only bumps a counter (~200/s);
+ * the heartbeat log brackets a menu hold, so the first post-release delta
+ * shows whether it kept counting while WaitNextEvent starved. If it did,
+ * the decoder can live there and the ring survives menus; if not, the
+ * experiment dies here for the price of one build.
+ * MP tasks get NO Toolbox, NO Memory Manager, NO Open Transport. */
+static int                    gMPOk        = 0;    /* MPLibraryIsLoaded() at boot */
+static MPTaskID               gMPProbeTask = NULL;
+static MPQueueID              gMPProbeQ    = NULL; /* termination notifications */
+static volatile unsigned long gMPBeat      = 0;    /* task writes, main reads */
+static volatile long          gMPProbeQuit = 0;    /* main writes, task reads */
+
+static OSStatus MPProbeProc(void *param)
+{
+    AbsoluteTime wake;
+    (void)param;
+    while (!gMPProbeQuit) {
+        gMPBeat++;
+        wake = AddDurationToAbsolute(5 * kDurationMillisecond, UpTime());
+        MPDelayUntil(&wake);
+    }
+    return noErr;                 /* task exit posts to gMPProbeQ */
+}
+
+static void StartMPProbe(void)
+{
+    OSStatus err;
+    if (!gMPOk) return;
+    err = MPCreateQueue(&gMPProbeQ);
+    if (err == noErr)
+        err = MPCreateTask(MPProbeProc, NULL, 32 * 1024, gMPProbeQ,
+                           NULL, NULL, 0, &gMPProbeTask);
+    if (err != noErr) {
+        DbgLog("mp: probe task failed (err=%ld)", (long)err);
+        if (gMPProbeQ) { MPDeleteQueue(gMPProbeQ); gMPProbeQ = NULL; }
+        gMPProbeTask = NULL;
+        return;
+    }
+    DbgLog("mp: probe task up (%ld cpu)", (long)MPProcessors());
+}
+
+static void StopMPProbe(void)
+{
+    void *p1, *p2, *p3;
+    if (!gMPProbeTask) return;
+    gMPProbeQuit = 1;             /* task exits its loop within ~5 ms */
+    if (MPWaitOnQueue(gMPProbeQ, &p1, &p2, &p3,
+                      1000 * kDurationMillisecond) != noErr) {
+        DbgLog("mp: probe join timeout, terminating");
+        MPTerminateTask(gMPProbeTask, noErr);
+        MPWaitOnQueue(gMPProbeQ, &p1, &p2, &p3, 1000 * kDurationMillisecond);
+    }
+    MPDeleteQueue(gMPProbeQ);
+    gMPProbeQ = NULL;
+    gMPProbeTask = NULL;
+    DbgLog("mp: probe down, %lu beats", gMPBeat);
+}
+
+static void TickMPProbe(void)
+{
+    static unsigned long lastLog = 0, lastBeat = 0;
+    unsigned long now;
+    if (!gMPProbeTask) return;
+    now = (unsigned long)TickCount();
+    if (now - lastLog >= 300) {   /* ~5 s cadence; the delta spanning a menu
+                                   * hold is the whole experiment */
+        DbgLog("mp: beat %lu (+%lu)", gMPBeat, gMPBeat - lastBeat);
+        lastBeat = gMPBeat;
+        lastLog  = now;
+    }
+}
+
+/* --- the cooperative loop, decomposed (b50) ------------------------------
+ * main()'s while stays the only clock; these are its limbs, extracted
+ * verbatim so the loop body reads as the schedule it actually is. */
+
+/* Short sleep while a fetch is in flight (spin the OT state machine),
+ * calmer when idle between polls, calmer still suspended in the
+ * background — unless audio is playing, which wants regular service. */
+static long ComputeSleep(void)
+{
+    return gTx ? 1L : ((gSuspended && gAuSt == AU_IDLE) ? 60L : 10L);
+}
+
+static void HandleEvent(EventRecord *ev)
+{
+    switch (ev->what) {
+        case mouseDown:
+            DoMouseDown(ev);
+            break;
+        case keyDown:
+        case autoKey: {
+            char ch = (char)(ev->message & charCodeMask);
+            if (ev->modifiers & cmdKey) {
+                /* Hand-rolled shortcuts (b30): these actions left the
+                 * menu (menu tracking starves the audio ring) but keep
+                 * their keys. Everything else -> MenuKey (Prefs/Quit). */
+                if (ch == 'f' || ch == 'F') {
+                    if (gSearchEdit)
+                        SetKeyboardFocus(gWindow, gSearchEdit,
+                                         kControlFocusNextPart);
+                } else if (ch == 't' || ch == 'T') {
+                    ToggleListen();
+                } else if (ch == 'k' || ch == 'K') {
+                    StartCommand("/spot/api/1/wake?play=1");
+                } else if (ch == 'u' || ch == 'U') {
+                    gQueueKick = (unsigned long)TickCount();  /* refresh now */
+                } else {
+                    DoMenu(MenuKey(ch));
+                }
+            } else {
+                ControlHandle focus = NULL;
+                GetKeyboardFocus(gWindow, &focus);
+                if (focus && focus == gSearchEdit) {
+                    if (ch == '\r' || ch == '\n') RunSearch();
+                    else {
+                        /* Same port trap as IdleControls: HandleControlKey
+                         * draws the typed character into the CURRENT
+                         * port — pin it to the window. */
+                        GrafPtr save;
+                        GetPort(&save);
+                        SetPort((GrafPtr)gWindow);
+                        HandleControlKey(gSearchEdit,
+                             (short)((ev->message & keyCodeMask) >> 8), ch, ev->modifiers);
+                        SetPort(save);
+                    }
+                }
+            }
+            break;
+        }
+        case updateEvt: {
+            WindowRef win = (WindowRef)ev->message;
+            BeginUpdate(win);
+            if (win == gWindow) {
+                DrawWindowContents(win);          /* the player area */
+                DrawShelf(win);                   /* separator/labels/frames */
+                UpdateControls(win, ((GrafPtr)win)->visRgn);
+                if (gSearchList) LUpdate(((GrafPtr)win)->visRgn, gSearchList);
+                if (gQueueList)  LUpdate(((GrafPtr)win)->visRgn, gQueueList);
+            }
+            EndUpdate(win);
+            break;
+        }
+        case osEvt:
+            /* Suspend/resume (Fio C; SIZE has acceptSuspendResumeEvents):
+             * in the background no NEW polls start (PollNetwork/PumpAux
+             * check gSuspended) — in-flight transactions still drain and
+             * ⌘T audio plays on. Resume kicks an immediate /now. */
+            if (((ev->message >> 24) & 0xFF) == suspendResumeMessage) {
+                gSuspended = (ev->message & resumeFlag) == 0;
+                if (!gSuspended) gLastPoll = 0;
+            }
+            break;
+        case kHighLevelEvent:
+            AEProcessAppleEvent(ev);   /* quit + do script (b36) */
+            break;
+        default:
+            break;
+    }
+}
+
+static void TickCaret(void)
+{
+    GrafPtr save;
+    if (!gWindow) return;
+    /* IdleControls draws into the CURRENT port — pin it to the window
+     * or the caret lands wherever the last draw left the port. */
+    GetPort(&save);
+    SetPort((GrafPtr)gWindow);
+    IdleControls(gWindow);
+    SetPort(save);
+}
+
+static void TickDiagnostics(void)
+{
+    /* animate the diagnostics ~2x/sec so it's visible the loop is alive */
+    static unsigned long lastDraw = 0;
+    unsigned long now = (unsigned long)TickCount();
+    if (now - lastDraw >= 30) { lastDraw = now; Redraw(); }
+}
+
 int main(void)
 {
     EventRecord ev;
@@ -2090,12 +2289,14 @@ int main(void)
     RegisterAppearanceClient();               /* opt into the Platinum look */
 
     gQTOk = (EnterMovies() == noErr);         /* QuickTime for cover-art decode */
-    {   /* boot line: which build, and exactly which QuickTime is under us */
+    gMPOk = MPLibraryIsLoaded();              /* preemptive tasks available? (b50) */
+    {   /* boot line: which build, and exactly which QuickTime/MP is under us */
         long qtv = 0;
         Gestalt(gestaltQuickTimeVersion, &qtv);
-        DbgLog("boot %s  QT=%s ver=%08lx", CQ_BUILD_TAG,
-               gQTOk ? "ok" : "MISSING", qtv);
+        DbgLog("boot %s  QT=%s ver=%08lx  MP=%s", CQ_BUILD_TAG,
+               gQTOk ? "ok" : "MISSING", qtv, gMPOk ? "yes" : "no");
     }
+    StartMPProbe();                           /* b50 smoke probe (no-op if MP=no) */
 
     {   /* converters: UTF-8 -> MacRoman (draw) and MacRoman -> UTF-8 (wire) */
         TextEncoding utf8 = CreateTextEncoding(kTextEncodingUnicodeV2_0,
@@ -2149,103 +2350,16 @@ int main(void)
     }
 
     while (gRunning) {
-        /* Short sleep while a fetch is in flight (spin the OT state machine),
-         * calmer when idle between polls, calmer still suspended in the
-         * background — unless audio is playing, which wants regular service. */
-        long sleep = gTx ? 1L : ((gSuspended && gAuSt == AU_IDLE) ? 60L : 10L);
-        if (WaitNextEvent(everyEvent, &ev, sleep, NULL)) {
-            switch (ev.what) {
-                case mouseDown:
-                    DoMouseDown(&ev);
-                    break;
-                case keyDown:
-                case autoKey: {
-                    char ch = (char)(ev.message & charCodeMask);
-                    if (ev.modifiers & cmdKey) {
-                        /* Hand-rolled shortcuts (b30): these actions left the
-                         * menu (menu tracking starves the audio ring) but keep
-                         * their keys. Everything else -> MenuKey (Prefs/Quit). */
-                        if (ch == 'f' || ch == 'F') {
-                            if (gSearchEdit)
-                                SetKeyboardFocus(gWindow, gSearchEdit,
-                                                 kControlFocusNextPart);
-                        } else if (ch == 't' || ch == 'T') {
-                            ToggleListen();
-                        } else if (ch == 'k' || ch == 'K') {
-                            StartCommand("/spot/api/1/wake?play=1");
-                        } else if (ch == 'u' || ch == 'U') {
-                            gQueueKick = (unsigned long)TickCount();  /* refresh now */
-                        } else {
-                            DoMenu(MenuKey(ch));
-                        }
-                    } else {
-                        ControlHandle focus = NULL;
-                        GetKeyboardFocus(gWindow, &focus);
-                        if (focus && focus == gSearchEdit) {
-                            if (ch == '\r' || ch == '\n') RunSearch();
-                            else {
-                                /* Same port trap as IdleControls: HandleControlKey
-                                 * draws the typed character into the CURRENT
-                                 * port — pin it to the window. */
-                                GrafPtr save;
-                                GetPort(&save);
-                                SetPort((GrafPtr)gWindow);
-                                HandleControlKey(gSearchEdit,
-                                     (short)((ev.message & keyCodeMask) >> 8), ch, ev.modifiers);
-                                SetPort(save);
-                            }
-                        }
-                    }
-                    break;
-                }
-                case updateEvt: {
-                    WindowRef win = (WindowRef)ev.message;
-                    BeginUpdate(win);
-                    if (win == gWindow) {
-                        DrawWindowContents(win);          /* the player area */
-                        DrawShelf(win);                   /* separator/labels/frames */
-                        UpdateControls(win, ((GrafPtr)win)->visRgn);
-                        if (gSearchList) LUpdate(((GrafPtr)win)->visRgn, gSearchList);
-                        if (gQueueList)  LUpdate(((GrafPtr)win)->visRgn, gQueueList);
-                    }
-                    EndUpdate(win);
-                    break;
-                }
-                case osEvt:
-                    /* Suspend/resume (Fio C; SIZE has acceptSuspendResumeEvents):
-                     * in the background no NEW polls start (PollNetwork/PumpAux
-                     * check gSuspended) — in-flight transactions still drain and
-                     * ⌘T audio plays on. Resume kicks an immediate /now. */
-                    if (((ev.message >> 24) & 0xFF) == suspendResumeMessage) {
-                        gSuspended = (ev.message & resumeFlag) == 0;
-                        if (!gSuspended) gLastPoll = 0;
-                    }
-                    break;
-                case kHighLevelEvent:
-                    AEProcessAppleEvent(&ev);   /* quit + do script (b36) */
-                    break;
-                default:
-                    break;
-            }
-        }
-        PollNetwork();
-        PumpAux();
-        if (gWindow) {   /* blink the search caret */
-            /* IdleControls draws into the CURRENT port — pin it to the window
-             * or the caret lands wherever the last draw left the port. */
-            GrafPtr save;
-            GetPort(&save);
-            SetPort((GrafPtr)gWindow);
-            IdleControls(gWindow);
-            SetPort(save);
-        }
-
-        {   /* animate the diagnostics ~2x/sec so it's visible the loop is alive */
-            unsigned long now = (unsigned long)TickCount();
-            if (now - gLastDraw >= 30) { gLastDraw = now; Redraw(); }
-        }
+        if (WaitNextEvent(everyEvent, &ev, ComputeSleep(), NULL))
+            HandleEvent(&ev);
+        PollNetwork();       /* /now poll + command/cover/debounce pumps */
+        PumpAux();           /* fire/pls/search/queue pumps + ServiceAudio */
+        TickCaret();         /* blink the search caret (port-pinned) */
+        TickDiagnostics();   /* ~2x/sec status animation */
+        TickMPProbe();       /* b50: preemptive-task liveness heartbeat */
     }
 
+    StopMPProbe();
     StopAudio("quit");
     if (gLogRef) { DbgLog("quit"); FSClose(gLogRef); gLogRef = 0; }
     if (gTx) { cq_tx_cancel(gTx); cq_tx_free(gTx); }

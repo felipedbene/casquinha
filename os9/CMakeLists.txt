@@ -19,6 +19,7 @@ add_application(Casquinha
     ../src/cq_pls.c
     ../src/cq_mp3.c               # MP3 frame sync for the ⌘T audio wire (b16)
     ../src/cq_mp3dec.c            # minimp3 decode seam (b21 — QT decodes nothing)
+    ../src/cq_decring.c           # comp SPSC ring + decode pump (b51, exp/mp-decode)
     ../src/cq_transport_ot.c      # Open Transport backend (guarded by CQ_OS9)
 )
 
@@ -38,6 +39,8 @@ target_link_libraries(Casquinha
     TextCommon
     QuickTimeLib           # GraphicsImporter cover-art decode (Fio 5)
     SoundLib               # SndChannel + SoundConverter (⌘T audio, b16)
+    MPLibrary              # preemptive tasks (exp/mp-decode, b50 smoke probe)
+    DriverServicesLib      # UpTime/AddDurationToAbsolute for MP task pacing
 )
 
 # The MP3 decoder must OUTRUN realtime on an emulated PPC (38 frames/s at

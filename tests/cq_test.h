@@ -32,6 +32,7 @@ void debounce_tests(void);
 void pls_tests(void);
 void mp3_tests(void);
 void mp3dec_tests(void);
+void decring_tests(void);
 void backoff_tests(void);
 void cache_tests(void);
 void transport_tests(void);

@@ -21,7 +21,8 @@ CORE_SRC = \
 	src/cq_cache.c \
 	src/cq_pls.c \
 	src/cq_mp3.c \
-	src/cq_mp3dec.c
+	src/cq_mp3dec.c \
+	src/cq_decring.c
 
 # Transport: the POSIX impl is the host/test one; the Open Transport impl
 # (src/cq_transport_ot.c) is compiled only in the ppc app build (-DCQ_OS9).
@@ -37,6 +38,7 @@ TEST_SRC = \
 	tests/pls_test.c \
 	tests/mp3_test.c \
 	tests/mp3dec_test.c \
+	tests/decring_test.c \
 	tests/backoff_test.c \
 	tests/cache_test.c \
 	tests/transport_test.c \
