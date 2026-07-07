@@ -75,7 +75,7 @@ enum {
     kQuitItem    = 3     /* Preferences, -, Quit */
 };
 
-#define CQ_BUILD_TAG "b54"  /* bump on every VM-iteration build (see status row,
+#define CQ_BUILD_TAG "b55"  /* bump on every VM-iteration build (see status row,
                              * the share filenames, and the per-build log name) */
 #define CQ_DEFAULT_HOST "10.0.100.112"  /* server address is a pref (Fio 6) */
 #define CQ_DEFAULT_PORT 70
@@ -218,12 +218,6 @@ static cq_debounce   gDeb;               /* pre-wire coalescer for prev/next (la
 static unsigned long gCmdFire = 0;       /* tick to flush the debounced command */
 static cq_transport *gCmd = NULL;        /* in-flight command transaction */
 static unsigned long gVolHold = 0;       /* ignore poll volume until this tick (law 4) */
-/* b53/b54 live-cut state (declared here because AdoptReply confirms the cut;
- * the machinery lives with the audio engine). Both are main-only ticks|1. */
-static unsigned long gCutArmed   = 0;    /* a transport command went out; cut
-                                            WHEN the upstream change confirms */
-static unsigned long gCutPending = 0;    /* confirmed: apply the skip once the
-                                            compressed tail has decoded */
 
 #define CQ_DEBOUNCE_TICKS 18             /* ~0.3 s settle before a prev/next reaches the wire */
 #define CQ_HOLD_TICKS    180             /* ~3 s single hold window on the volume slider */
@@ -546,8 +540,6 @@ static void UpdatePlayTitle(void)
 }
 
 static void StartCommand(const char *sel);   /* defined with the transport glue */
-static void TrimToLive(void);                /* b53 live-cut; defined with the
-                                                audio engine */
 static void PlayItem(cq_track_list *items, int row);   /* search/queue section */
 static void PlayFrom(cq_track_list *items, int row, cq_track_list *cont);
 static void StartFire(const char *sel);
@@ -681,24 +673,6 @@ static void AdoptReply(const unsigned char *d, size_t len, int isCmd)
             } else if (tmp.state == CQ_STATE_PLAYING) {
                 gAutoNexted = 0;
             }
-            if (gCutArmed) {
-                /* b54: the live-cut waits for UPSTREAM CONFIRMATION. The b53
-                 * field flop: a /next that no-ops in a dead context (b37) got
-                 * an audible 6 s jump-cut with no track change behind it —
-                 * and spent the cushion for nothing. Cut only when the
-                 * adopted snapshot proves the command landed (track flip or
-                 * state flip); a command that sank disarms quietly. */
-                int flipped = (tmp.track_id && (!gSnap.track_id ||
-                                strcmp(tmp.track_id, gSnap.track_id) != 0)) ||
-                              (gHaveSnap && tmp.state != gSnap.state);
-                if (flipped) {
-                    gCutArmed = 0;
-                    gCutPending = (unsigned long)TickCount() | 1;
-                } else if ((unsigned long)TickCount() - gCutArmed > 900) {
-                    gCutArmed = 0;         /* ~15 s: the command sank */
-                    DbgLog("audio: live-cut disarmed (no upstream change)");
-                }
-            }
             /* Track changed = the queue definitely moved (head consumed /
              * jump landed). Kick ONE queue re-poll now instead of waiting
              * out the 10 s cadence — event-driven freshness at ~one extra
@@ -795,12 +769,7 @@ static void StartCommand(const char *sel)
 {
     if (gCmd) return;
     gCmd = cq_tx_new(gHost, gPort, sel);
-    if (gCmd) {
-        cq_tx_start(gCmd);
-        TrimToLive();   /* b53: every transport command rides this channel —
-                           jump the radio toward the live edge so the change
-                           reaches the ear fast despite the deep cushion */
-    }
+    if (gCmd) cq_tx_start(gCmd);
 }
 
 /* Decode JPEG cover bytes into a 64x64 GWorld via QuickTime's GraphicsImporter.
@@ -1132,8 +1101,6 @@ static void PlayItem(cq_track_list *items, int row)
     EscInto(items->items[row].uri, euri, sizeof(euri), 1);   /* keep the colons */
     snprintf(sel, sizeof(sel), "/spot/play?uri=%s", euri);
     StartFire(sel);
-    TrimToLive();   /* b53: a jump-to-track is a transport command too (its
-                       sibling queue/add is NOT — no audible change to chase) */
 }
 
 /* Native "from here onward" (b41, design/SPEC-play-from.md): send bare track
@@ -1257,22 +1224,22 @@ typedef enum { AU_IDLE = 0, AU_HTTP, AU_SYNC, AU_PLAY } au_state;
  * the live edge, applied by the interrupt so the read cursor has exactly one
  * writer.
  *
- * b53 repricing: with the decoder preemptive (b52), a deep standing backlog
- * finally WORKS as freeze immunity — so we keep it (target ~7.4 s; the
- * standing trim is now just a near-full guard), and pay the latency only at
- * the moment it matters: a transport command (Next/Prev/Play…) fires a
- * LIVE-CUT, the same one-shot skip, down to CQ_AUD_CMD_TARGET. Continuous
- * listening survives menus and drags; your click still reaches the ear in
- * ~3 s. The deep cushion itself must arrive at connect — the Icecast burst
- * (design/SPEC-burst.md asks gopher-spot for ~256 KB). */
+ * b53-b55, the deep-cushion experiment (design/CUSHION-PHYSICS.md has the
+ * full post-mortem): with the decoder preemptive (b52) we tried holding
+ * ~7.4 s of backlog as freeze immunity and jump-cutting to the live edge on
+ * transport commands. Both cut triggers failed in the field — cut-on-send
+ * (b53) jumps audibly when the command no-ops upstream (b37 dead context);
+ * cut-on-confirmation (b54) misattributes NATURAL track flips that race a
+ * pending command, stealing the very transition the listener was about to
+ * hear (with a deep cushion, /now flips ~cushion seconds before the ear).
+ * Underneath sits a conservation law: ear-lag == cushion — deep freeze
+ * immunity and fast command response cannot coexist at one instant. b55
+ * returns to the b31-proven shallow target; what the experiment KEEPS is the
+ * preemptive decoder (instant catch-up, no decode-stop during freezes) and
+ * the server-side queue-size (no more slow-client disconnects). */
 #define CQ_AUD_PREBUF_PCM  (384L * 1024L)  /* ~2.2 s decoded before starting */
-#define CQ_AUD_RING_TARGET (1280L * 1024L) /* keep ~7.4 s: the freeze cushion */
+#define CQ_AUD_RING_TARGET (512L * 1024L)  /* trim back to ~2.9 s of backlog */
 #define CQ_AUD_TRIM_SLACK  (256L * 1024L)  /* +1.5 s hysteresis before trimming */
-#define CQ_AUD_CMD_TARGET  (384L * 1024L)  /* live-cut leaves ~2.2 s — the launch
-                                              cushion; it does NOT regrow (a live
-                                              mount arrives at playback rate), so
-                                              a command spends the connection's
-                                              burst until the next reconnect */
 #define CQ_AUD_COMP_MAX   (64 * 1024)      /* pre-play staging (header strip + sync) */
 #define CQ_AUD_COMP_RING  (256L * 1024L)   /* compressed SPSC ring feeding the
                                               decode pipeline (cq_decring, b51) —
@@ -1530,8 +1497,6 @@ static void StopAudio(const char *why)
     gPlaying = 0;
     gRingWr = gRingRd = 0;
     gRingSkip = 0;
-    gCutArmed = 0;
-    gCutPending = 0;
     gStarveUntil = 0;
     gMountDry = 0;
 }
@@ -1634,20 +1599,6 @@ static void DrainStreamToDec(void)
         if (gRxTotal <= 12288)
             DbgLog("audio: rx +%ld (total %ld)", (long)n, gRxTotal);
     }
-}
-
-/* b53 live-cut, phase 1 (revised b54): a transport command just left for the
- * wire. The deep ring backlog (freeze immunity) becomes pure command→ear
- * delay ONCE THE COMMAND ACTUALLY LANDS — so this only ARMS the cut;
- * AdoptReply confirms it against the next snapshot (track/state flip), and
- * ServiceAudio applies it after the compressed tail has decoded. Costs ~one
- * poll (1-2 s) over cutting blind, invisible next to the server floor; a
- * no-op command (b37 dead context) never cuts. */
-static void TrimToLive(void)
-{
-    if (gAuSt != AU_PLAY || !gPlaying) return;
-    gCutArmed = (unsigned long)TickCount() | 1;   /* |1: tick 0 still arms;
-                                                     re-arm extends the window */
 }
 
 /* Advance the whole audio pipeline one bounded slice; never blocks. */
@@ -1766,24 +1717,6 @@ static void ServiceAudio(void)
             if (gDec.flushes != gDecFluSeen) {
                 gDecFluSeen = gDec.flushes;
                 DbgLog("audio: staging unparseable, flushed (x%ld)", gDec.flushes);
-            }
-        }
-        if (gCutPending) {   /* b53 live-cut, phase 2: once the compressed tail
-                              * has decoded (or ~2 s passed), skip the PCM
-                              * backlog in one interrupt-applied cut */
-            unsigned long backlog = gDec.comp_wr - gDec.comp_rd + gDec.stage_len;
-            if (backlog < 4096 ||
-                (long)((unsigned long)TickCount() - gCutPending) > 120) {
-                if (gRingSkip == 0) {
-                    unsigned long fill = gRingWr - gRingRd;
-                    if (fill > (unsigned long)(CQ_AUD_CMD_TARGET + CQ_AUD_CHUNK)) {
-                        gRingSkip = (long)(fill - CQ_AUD_CMD_TARGET);
-                        gTrims++;
-                        DbgLog("audio: live-cut, skipping %ld KB (command)",
-                               (long)((fill - CQ_AUD_CMD_TARGET) / 1024));
-                    }
-                    gCutPending = 0;
-                }   /* else a trim is in flight; retry next pass */
             }
         }
         if (!gPlaying) {
