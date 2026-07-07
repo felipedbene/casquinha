@@ -56,6 +56,7 @@
 #include "cq_cache.h"
 #include "cq_debounce.h"
 #include "cq_track.h"
+#include "cq_reflist.h"
 #include "cq_pls.h"
 #include "cq_mp3.h"
 #include "cq_mp3dec.h"
@@ -76,7 +77,7 @@ enum {
     kQuitItem    = 3     /* Preferences, -, Quit */
 };
 
-#define CQ_BUILD_TAG "b56"  /* bump on every VM-iteration build (see status row,
+#define CQ_BUILD_TAG "b57"  /* bump on every VM-iteration build (see status row,
                              * the share filenames, and the per-build log name) */
 #define CQ_DEFAULT_HOST "10.0.100.112"  /* server address is a pref (Fio 6) */
 #define CQ_DEFAULT_PORT 70
@@ -274,6 +275,19 @@ static ListHandle    gSearchList = NULL;
 static ControlHandle gSearchEdit = NULL;
 static cq_transport *gSearchTx = NULL;
 static cq_track_list gSearchItems;
+/* Artists & albums in the SAME result list (b57): a search now surfaces three
+ * kinds. The list renders artist rows, then album rows, then track rows; the
+ * clicked row's index maps back to a kind via the three counts (ResultKind).
+ * Clicking an artist DRILLS into its discography (gArtistTx -> the album list,
+ * gAlbumBrowse=1); clicking an album plays the WHOLE thing (play/context);
+ * a track plays as before. */
+static cq_ref_list   gSearchArtists;        /* search artist.<i>.{id,name} */
+static cq_ref_list   gSearchAlbums;         /* search album.<i>.{id,name} */
+static cq_ref_list   gArtistAlbums;         /* one artist's discography (drilled in) — kept
+                                              separate so "< back" restores the search results */
+static cq_transport *gArtistTx = NULL;      /* /artist/<id>/albums drill in flight */
+static int           gAlbumBrowse = 0;      /* 1 = list shows one artist's albums (drilled in) */
+static char          gBrowseArtist[64] = "";/* the artist name we drilled into (status/back row) */
 static ListHandle    gQueueList = NULL;
 static cq_transport *gQueueTx = NULL;
 static cq_track_list gQueueItems;
@@ -561,6 +575,14 @@ static void UpdatePlayTitle(void)
 static void StartCommand(const char *sel);   /* defined with the transport glue */
 static void PlayItem(cq_track_list *items, int row);   /* search/queue section */
 static void PlayFrom(cq_track_list *items, int row, cq_track_list *cont);
+static void FillResults(void);                         /* artists+albums+tracks in gSearchList */
+static void StartArtistAlbums(const char *artistId, const char *artistName);
+static void PlayContextAlbum(const char *albumId);
+/* Result rows are laid out artists, then albums, then tracks (normal search),
+ * or a "back" row then albums (drilled into one artist). Map a list row to its
+ * kind + index within that kind's list. */
+typedef enum { CQ_ROW_ARTIST, CQ_ROW_ALBUM, CQ_ROW_TRACK, CQ_ROW_BACK, CQ_ROW_NONE } cq_row_kind;
+static cq_row_kind ResultKindAt(int row, size_t *localIdx);
 static void StartFire(const char *sel);
 static void EscInto(const char *s, char *out, size_t max, int keepColon);
 static int gAutoNexted = 0;   /* end-of-track watchdog: one auto-next per stop */
@@ -1040,9 +1062,34 @@ static void DoContentClick(WindowRef win, Point where)
             SetPt(&c, 0, 0);
             if (LGetSelect(true, &c, list)) {
                 /* Native contexts (b41): a queue row plays from there onward;
-                 * a search hit plays now and continues with the queue. */
-                if (list == gSearchList) PlayFrom(items, c.v, &gQueueItems);
-                else                     PlayFrom(items, c.v, NULL);
+                 * a search hit plays now and continues with the queue. b57: a
+                 * search-list row can also be an artist (drill into its albums)
+                 * or an album (play the whole thing) — route by row kind. */
+                if (list == gSearchList) {
+                    size_t li = 0;
+                    switch (ResultKindAt(c.v, &li)) {
+                    case CQ_ROW_TRACK:
+                        PlayFrom(&gSearchItems, (int)li, &gQueueItems);
+                        break;
+                    case CQ_ROW_ARTIST:
+                        StartArtistAlbums(gSearchArtists.items[li].id,
+                                          gSearchArtists.items[li].name);
+                        break;
+                    case CQ_ROW_ALBUM: {
+                        cq_ref_list *src = gAlbumBrowse ? &gArtistAlbums : &gSearchAlbums;
+                        if (li < src->count) PlayContextAlbum(src->items[li].id);
+                        break;
+                    }
+                    case CQ_ROW_BACK:
+                        gAlbumBrowse = 0;
+                        FillResults();   /* back to the last search's results */
+                        break;
+                    default:
+                        break;
+                    }
+                } else {
+                    PlayFrom(items, c.v, NULL);
+                }
             }
         }
     }
@@ -1093,6 +1140,122 @@ static void FillList(ListHandle list, cq_track_list *items)
         InvalRect(&(*list)->rView);
         SetPort(save);
     }
+}
+
+/* Append one MacRoman-encoded row to gSearchList at row r. */
+static void AddResultRow(ListHandle list, short r, const char *text)
+{
+    char mac[300];
+    short len = ToMacRoman(text, mac, sizeof(mac));
+    Cell cell;
+    LAddRow(1, r, list);
+    SetPt(&cell, 0, r);
+    LSetCell(mac, len, cell, list);
+}
+
+/* Fill gSearchList with the current results. Normal search: artist rows, then
+ * album rows, then track rows — each labelled so the gesture reads (tap an
+ * artist to see its albums, an album to play the whole thing). Drilled into one
+ * artist (gAlbumBrowse): a "< back" row, then that artist's albums. Mirrors
+ * FillList's port dance so the invalidate lands in the list's own window. */
+static void FillResults(void)
+{
+    ListHandle list = gSearchList;
+    size_t i;
+    short r = 0;
+    if (!list) return;
+    LDelRow(0, 0, list);
+
+    if (gAlbumBrowse) {
+        char back[256];
+        snprintf(back, sizeof(back), "< %s", gBrowseArtist[0] ? gBrowseArtist : "voltar");
+        AddResultRow(list, r++, back);
+        for (i = 0; i < gArtistAlbums.count; i++) {
+            char row[256];
+            snprintf(row, sizeof(row), "  album: %s",
+                     gArtistAlbums.items[i].name ? gArtistAlbums.items[i].name : "?");
+            AddResultRow(list, r++, row);
+        }
+    } else {
+        for (i = 0; i < gSearchArtists.count; i++) {
+            char row[256];
+            snprintf(row, sizeof(row), "artista: %s",
+                     gSearchArtists.items[i].name ? gSearchArtists.items[i].name : "?");
+            AddResultRow(list, r++, row);
+        }
+        for (i = 0; i < gSearchAlbums.count; i++) {
+            char row[256];
+            snprintf(row, sizeof(row), "album: %s",
+                     gSearchAlbums.items[i].name ? gSearchAlbums.items[i].name : "?");
+            AddResultRow(list, r++, row);
+        }
+        for (i = 0; i < gSearchItems.count; i++) {
+            char row[256];
+            snprintf(row, sizeof(row), "%s - %s",
+                     gSearchItems.items[i].track  ? gSearchItems.items[i].track  : "?",
+                     gSearchItems.items[i].artist ? gSearchItems.items[i].artist : "");
+            AddResultRow(list, r++, row);
+        }
+    }
+    {
+        GrafPtr save;
+        GetPort(&save);
+        SetPort((*list)->port);
+        InvalRect(&(*list)->rView);
+        SetPort(save);
+    }
+}
+
+/* Map a clicked list row to its kind + index within that kind's sub-list. Row
+ * layout matches FillResults: artists|albums|tracks, or back|albums when drilled. */
+static cq_row_kind ResultKindAt(int row, size_t *localIdx)
+{
+    size_t r;
+    if (row < 0) return CQ_ROW_NONE;
+    r = (size_t)row;
+    if (gAlbumBrowse) {
+        if (r == 0) return CQ_ROW_BACK;
+        r -= 1;
+        if (r < gArtistAlbums.count) { if (localIdx) *localIdx = r; return CQ_ROW_ALBUM; }
+        return CQ_ROW_NONE;
+    }
+    if (r < gSearchArtists.count) { if (localIdx) *localIdx = r; return CQ_ROW_ARTIST; }
+    r -= gSearchArtists.count;
+    if (r < gSearchAlbums.count) { if (localIdx) *localIdx = r; return CQ_ROW_ALBUM; }
+    r -= gSearchAlbums.count;
+    if (r < gSearchItems.count) { if (localIdx) *localIdx = r; return CQ_ROW_TRACK; }
+    return CQ_ROW_NONE;
+}
+
+/* Drill into an artist: fetch /spot/api/1/artist/<id>/albums. The reply (parsed
+ * in the tx pump) becomes gSearchAlbums and flips the list into gAlbumBrowse. */
+static void StartArtistAlbums(const char *artistId, const char *artistName)
+{
+    char sel[128];
+    if (!artistId || !artistId[0]) return;
+    if (gArtistTx) { cq_tx_cancel(gArtistTx); cq_tx_free(gArtistTx); gArtistTx = NULL; }
+    snprintf(sel, sizeof(sel), "/spot/api/1/artist/%s/albums", artistId);
+    strncpy(gBrowseArtist, artistName ? artistName : "", sizeof(gBrowseArtist) - 1);
+    gBrowseArtist[sizeof(gBrowseArtist) - 1] = '\0';
+    gArtistTx = cq_tx_new(gHost, gPort, sel);
+    if (gArtistTx) cq_tx_start(gArtistTx);
+    DbgLog("drill: artist %s albums", artistId);
+}
+
+/* Play a WHOLE album as a context — the native "queue this album" (one PUT,
+ * Spotify owns the continuation). Its reply is a settled /now, so it goes
+ * through StartCommand/AdoptReply like play/pause, and the intent gives cq_view
+ * an instant ack. */
+static void PlayContextAlbum(const char *albumId)
+{
+    char uri[80], euri[160], sel[224];
+    if (!albumId || !albumId[0]) return;
+    snprintf(uri, sizeof(uri), "spotify:album:%s", albumId);
+    EscInto(uri, euri, sizeof(euri), 1);   /* keep the colons */
+    snprintf(sel, sizeof(sel), "/spot/api/1/play/context?uri=%s", euri);
+    SetIntent(CQ_INTENT_PLAY);
+    StartCommand(sel);
+    DbgLog("play/context: album %s", albumId);
 }
 
 static ListHandle MakeList(WindowRef win, const Rect *area)
@@ -1187,6 +1350,11 @@ static void RunSearch(void)
     ToUTF8(q, q8, sizeof(q8));       /* MacRoman field -> UTF-8 wire (Fio F) */
     EscInto(q8, eq, sizeof(eq), 0);
     snprintf(sel, sizeof(sel), "/spot/api/1/search?q=%s", eq);
+    /* A fresh search leaves any artist-drill (b57): clear browse mode and the
+     * drilled discography so the reply repaints normal artist/album/track rows. */
+    gAlbumBrowse = 0;
+    gBrowseArtist[0] = '\0';
+    if (gArtistTx) { cq_tx_cancel(gArtistTx); cq_tx_free(gArtistTx); gArtistTx = NULL; }
     if (gSearchTx) { cq_tx_cancel(gSearchTx); cq_tx_free(gSearchTx); }
     gSearchTx = cq_tx_new(gHost, gPort, sel);
     if (gSearchTx) cq_tx_start(gSearchTx);
@@ -1199,10 +1367,13 @@ static void QueueSelected(void)
 {
     Cell c;
     char euri[128], sel[192];
+    size_t li = 0;
     SetPt(&c, 0, 0);
     if (!gSearchList || !LGetSelect(true, &c, gSearchList)) return;
-    if (c.v < 0 || (size_t)c.v >= gSearchItems.count || !gSearchItems.items[c.v].uri) return;
-    EscInto(gSearchItems.items[c.v].uri, euri, sizeof(euri), 1);   /* keep the colons */
+    /* Only a track row queues (b57): artist/album rows have no single uri. */
+    if (ResultKindAt(c.v, &li) != CQ_ROW_TRACK) return;
+    if (li >= gSearchItems.count || !gSearchItems.items[li].uri) return;
+    EscInto(gSearchItems.items[li].uri, euri, sizeof(euri), 1);   /* keep the colons */
     snprintf(sel, sizeof(sel), "/spot/api/1/queue/add?%s", euri);
     StartFire(sel);
 }
@@ -1980,11 +2151,33 @@ static void PumpAux(void)
         if (st == CQ_TX_DONE) {
             size_t len = 0;
             const unsigned char *d = cq_tx_data(gSearchTx, &len);
+            /* One reply carries all three kinds (b57): tracks (item.*), artists
+             * (artist.*) and albums (album.*). Parse each; FillResults lays them
+             * out artist/album/track. */
             cq_track_list_free(&gSearchItems);
+            cq_ref_list_free(&gSearchArtists);
+            cq_ref_list_free(&gSearchAlbums);
             cq_track_list_from_response(&gSearchItems, d, len);
-            FillList(gSearchList, &gSearchItems);
+            cq_ref_list_from_response(&gSearchArtists, d, len, "artist");
+            cq_ref_list_from_response(&gSearchAlbums, d, len, "album");
+            gAlbumBrowse = 0;
+            FillResults();
             cq_tx_free(gSearchTx); gSearchTx = NULL;
         } else if (st == CQ_TX_FAILED) { cq_tx_free(gSearchTx); gSearchTx = NULL; }
+    }
+    if (gArtistTx) {
+        cq_tx_status st = cq_tx_poll(gArtistTx);
+        if (st == CQ_TX_DONE) {
+            size_t len = 0;
+            const unsigned char *d = cq_tx_data(gArtistTx, &len);
+            /* The discography rows are item.<i>.{id,name} — same shape as a ref
+             * block, prefix "item". Flip the list into browse mode. */
+            cq_ref_list_free(&gArtistAlbums);
+            cq_ref_list_from_response(&gArtistAlbums, d, len, "item");
+            gAlbumBrowse = 1;
+            FillResults();
+            cq_tx_free(gArtistTx); gArtistTx = NULL;
+        } else if (st == CQ_TX_FAILED) { cq_tx_free(gArtistTx); gArtistTx = NULL; }
     }
     if (gQueueTx) {
         cq_tx_status st = cq_tx_poll(gQueueTx);

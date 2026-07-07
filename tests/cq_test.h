@@ -27,6 +27,7 @@ int cq_have_fixtures(void);
 void codec_tests(void);
 void now_tests(void);
 void track_tests(void);
+void reflist_tests(void);
 void guard_tests(void);
 void view_tests(void);
 void debounce_tests(void);

@@ -12,6 +12,7 @@ add_application(Casquinha
     ../src/cq_codec.c
     ../src/cq_now.c
     ../src/cq_track.c
+    ../src/cq_reflist.c          # {id,name} ref lists: search artists/albums + discography (b57)
     ../src/cq_guard.c
     ../src/cq_view.c              # the one renderable truth (fio B)
     ../src/cq_debounce.c

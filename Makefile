@@ -15,6 +15,7 @@ CORE_SRC = \
 	src/cq_codec.c \
 	src/cq_now.c \
 	src/cq_track.c \
+	src/cq_reflist.c \
 	src/cq_guard.c \
 	src/cq_view.c \
 	src/cq_debounce.c \
@@ -34,6 +35,7 @@ TEST_SRC = \
 	tests/codec_test.c \
 	tests/now_test.c \
 	tests/track_test.c \
+	tests/reflist_test.c \
 	tests/guard_test.c \
 	tests/view_test.c \
 	tests/debounce_test.c \

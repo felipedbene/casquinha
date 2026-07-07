@@ -16,6 +16,7 @@ int main(void)
     codec_tests();
     now_tests();
     track_tests();
+    reflist_tests();
     guard_tests();
     view_tests();
     debounce_tests();
