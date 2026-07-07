@@ -21,6 +21,7 @@ int main(void)
     pls_tests();
     mp3_tests();
     mp3dec_tests();
+    decring_tests();
     backoff_tests();
     cache_tests();
     transport_tests();

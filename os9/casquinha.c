@@ -58,6 +58,7 @@
 #include "cq_pls.h"
 #include "cq_mp3.h"
 #include "cq_mp3dec.h"
+#include "cq_decring.h"
 #include "cq_transport.h"
 
 enum {
@@ -74,7 +75,7 @@ enum {
     kQuitItem    = 3     /* Preferences, -, Quit */
 };
 
-#define CQ_BUILD_TAG "b50"  /* bump on every VM-iteration build (see status row,
+#define CQ_BUILD_TAG "b51"  /* bump on every VM-iteration build (see status row,
                              * the share filenames, and the per-build log name) */
 #define CQ_DEFAULT_HOST "10.0.100.112"  /* server address is a pref (Fio 6) */
 #define CQ_DEFAULT_PORT 70
@@ -1225,13 +1226,25 @@ typedef enum { AU_IDLE = 0, AU_HTTP, AU_SYNC, AU_PLAY } au_state;
 #define CQ_AUD_PREBUF_PCM  (384L * 1024L)  /* ~2.2 s decoded before starting */
 #define CQ_AUD_RING_TARGET (512L * 1024L)  /* trim back to ~2.9 s of backlog */
 #define CQ_AUD_TRIM_SLACK  (256L * 1024L)  /* +1.5 s hysteresis before trimming */
-#define CQ_AUD_COMP_MAX   (64 * 1024)      /* compressed staging (decode workspace) */
+#define CQ_AUD_COMP_MAX   (64 * 1024)      /* pre-play staging (header strip + sync) */
+#define CQ_AUD_COMP_RING  (256L * 1024L)   /* compressed SPSC ring feeding the
+                                              decode pipeline (cq_decring, b51) —
+                                              ~16 s of 128 kbps ahead of the stage */
 
 static cq_transport  *gPls    = NULL;   /* /spot/stream.pls discovery */
 static cq_transport  *gStream = NULL;   /* the endless Icecast connection */
 static au_state       gAuSt   = AU_IDLE;
-static unsigned char  gComp[CQ_AUD_COMP_MAX];   /* compressed staging */
+static unsigned char  gComp[CQ_AUD_COMP_MAX];   /* pre-play staging: gStream drains
+                                                   here through AU_HTTP/AU_SYNC; at
+                                                   AU_PLAY the remainder hands off to
+                                                   gDec and this buffer goes quiet */
 static size_t         gCompLen = 0;
+static Ptr            gCompRing = NULL;         /* comp SPSC ring, NewPtr'd with gRing */
+static cq_decring     gDec;                     /* the decode pipeline (cq_decring.h):
+                                                   b51 pumps it inline on the loop,
+                                                   b52 moves the pump to an MP task */
+static long           gDecResSeen = 0;          /* pump counters already narrated */
+static long           gDecFluSeen = 0;
 static cq_mp3_frame   gFmt;             /* from the first confirmed frame */
 static SndChannelPtr  gChan = NULL;
 static Ptr            gRing = NULL;               /* PCM ring, NewPtr'd on first listen */
@@ -1248,9 +1261,6 @@ static volatile long  gRingSkip = 0;              /* one-shot latency trim reque
                                                     interrupt applies + zeroes it —
                                                     gRingRd keeps a single writer */
 static long           gTrims = 0;                 /* trims this listen */
-static long           gPcmTotal = 0;              /* PCM bytes decoded this listen */
-static long           gDecTicks = 0;              /* ticks spent inside the decoder */
-static long           gDecFrames = 0;             /* frames decoded this listen */
 static unsigned long  gStarveUntil = 0;           /* show "Buffering" until this tick */
 static int            gMountDry = 0;              /* rx parked >3 s while playing */
 static unsigned long  gAuBeat = 0;                /* heartbeat log tick */
@@ -1294,7 +1304,8 @@ static int ParseHttpUrl(const char *url, char *host, size_t hcap,
  * ring. Only reads gRingRd/gRingWr and the ring bytes; a starved ring is
  * served as silence with the buffer still marked ready, so the channel
  * keeps running and playback resumes on its own. No Memory Manager, no
- * Toolbox, just copies. */
+ * Toolbox, just copies. (The PCM producer behind gRingWr may become an MP
+ * task in b52 — same SPSC contract, nothing changes on this side.) */
 static pascal void AudioDoubleBack(SndChannelPtr chan, SndDoubleBufferPtr db)
 {
     unsigned long avail;
@@ -1340,6 +1351,9 @@ static void StopAudio(const char *why)
     if (gAuSt != AU_IDLE) DbgLog("audio: stopped (%s)", why);
     gAuSt = AU_IDLE;
     gCompLen = 0;
+    cq_decring_reset(&gDec);   /* b51: the pump runs on this loop, so resetting
+                                * here can't race it. b52 MUST park the MP task
+                                * (gDecCmd/gDecAck handshake) before this line. */
     gPlaying = 0;
     gRingWr = gRingRd = 0;
     gRingSkip = 0;
@@ -1352,18 +1366,32 @@ static void StopAudio(const char *why)
  * proved every QT route (URL movie, SoundConverter pull/push, both MP3
  * fourccs) consumes the stream and decodes nothing on QT 5.0.2. The channel
  * itself starts later, once the prebuffer is in the ring. */
+/* The pump's clock (cq_decring's injected now hook). b51: the pump runs on
+ * the event loop, so TickCount is legal and dec_time stays in ticks like the
+ * old gDecTicks. b52 swaps in an UpTime wrapper for the MP task (TickCount is
+ * a trap — illegal off the main context). */
+static unsigned long long DecNowTicks(void)
+{
+    return (unsigned long long)TickCount();
+}
+
 static int OpenAudioOutput(void)
 {
     if (!gRing) gRing = NewPtr(CQ_AUD_RING_BYTES);
     if (!gRing) { DbgLog("audio: NewPtr(ring %ld) failed", CQ_AUD_RING_BYTES); return 0; }
-    cq_mp3dec_init();
+    if (!gCompRing) gCompRing = NewPtr(CQ_AUD_COMP_RING);
+    if (!gCompRing) { DbgLog("audio: NewPtr(comp %ld) failed", CQ_AUD_COMP_RING); return 0; }
     gRingWr = gRingRd = 0;
+    cq_decring_init(&gDec, (unsigned char *)gCompRing, CQ_AUD_COMP_RING,
+                    (unsigned char *)gRing, CQ_AUD_RING_BYTES,
+                    &gRingWr, &gRingRd);
+    gDec.now = DecNowTicks;
+    gDecResSeen = gDecFluSeen = 0;
+    cq_mp3dec_init();
     gPlaying = 0;
     gDBFires = gDBSilence = 0;
     gRingSkip = 0;
     gTrims = 0;
-    gPcmTotal = 0;
-    gDecTicks = gDecFrames = 0;
     DbgLog("audio: output armed (minimp3), %d Hz %dch %d kbps",
            gFmt.samplerate, gFmt.channels, gFmt.bitrate_kbps);
     return 1;
@@ -1406,90 +1434,26 @@ static int StartDoubleBuffer(void)
     return 1;
 }
 
-/* Decode staged MP3 into the PCM ring (one frame per iteration, wrap-aware),
- * and start the double-buffer engine once the prebuffer is in. The decoder
- * skips junk itself; a consumed count of 0 means "partial frame tail — wait
- * for more bytes". Host-verified against a captured slice of this very
- * stream (tests/mp3dec_test.c). */
-static void PumpRing(void)
+/* The decode step itself — staging, the b26 tail-gate, the b27 resync, the
+ * minimp3 call, the wrap-aware ring write — moved verbatim to the portable
+ * pipeline in src/cq_decring.c (b51), where the host suite proves it
+ * byte-identical to a flat decode. Here remains only the wire-side feeder:
+ * drain the Icecast socket straight into the comp ring, zero-copy. */
+static void DrainStreamToDec(void)
 {
-    static short tmp[CQ_MP3DEC_MAX_SAMPLES];   /* one decoded frame, bounced
-                                                 into the ring with wrap */
-    size_t used = 0;
-
     for (;;) {
-        unsigned long space = CQ_AUD_RING_BYTES - (gRingWr - gRingRd);
-        int consumed = 0, fch = 0, fhz = 0, s;
-        /* NO latency gate here (b31): pausing the decoder just parks the
-         * backlog upstream in staging + transport where it can't be trimmed.
-         * Decode everything; the trim in ServiceAudio bounds the latency. */
-        if (space < (unsigned long)(CQ_MP3DEC_MAX_SAMPLES * 2)) break;  /* ring full */
-        if (used >= gCompLen) break;                                    /* staging dry */
-        {   /* NEVER feed the decoder an unconfirmed tail: minimp3 treats a
-             * final frame it cannot verify against the NEXT header as junk
-             * and EATS it silently (b26: ~40% of the input vanished this
-             * way, sil 138/207 fires). Hold the tail until its successor is
-             * fully staged; a dead stream flushes its true last frame. */
-            int wf = 0;
-            cq_mp3_walk(gComp + used, gCompLen - used, 2, &wf);
-            if (wf < (gStream ? 2 : 1)) {
-                /* Gate failing at the HEAD with a deep staging = junk from a
-                 * mid-stream splice, and the gate is blocking the very
-                 * resync that would skip it — b27 session 1 deadlocked here
-                 * for 20 s (staging full, rx frozen, ring starved). Realign
-                 * explicitly and drop the prefix. */
-                if (gCompLen - used > 8192) {
-                    cq_mp3_frame nf;
-                    long off = cq_mp3_sync(gComp + used, gCompLen - used, &nf);
-                    if (off > 0) {
-                        DbgLog("audio: resync +%ld (splice junk dropped)", off);
-                        used += (size_t)off;
-                        continue;
-                    }
-                    if (off < 0) {
-                        DbgLog("audio: staging unparseable, flushing %ld B",
-                               (long)(gCompLen - used));
-                        used = gCompLen;
-                    }
-                }
-                break;
-            }
-        }
-        {   /* decode-throughput probe: 60 Hz ticks integrated over many
-             * frames tell whether minimp3 keeps up with realtime (38 fps) */
-            unsigned long t0 = (unsigned long)TickCount();
-            s = cq_mp3dec_frame(gComp + used, gCompLen - used, tmp,
-                                &fch, &fhz, &consumed);
-            gDecTicks += (long)((unsigned long)TickCount() - t0);
-        }
-        if (consumed <= 0) break;                  /* partial tail: need bytes */
-        used += (size_t)consumed;
-        if (s <= 0) continue;                      /* junk skipped */
-        gDecFrames++;
-        {
-            long bytes = (long)s * fch * 2;
-            unsigned long wr = gRingWr % CQ_AUD_RING_BYTES;
-            long first = (long)(CQ_AUD_RING_BYTES - wr);
-            if (first > bytes) first = bytes;
-            memcpy(gRing + wr, tmp, (size_t)first);
-            if (bytes > first)
-                memcpy(gRing, (char *)tmp + first, (size_t)(bytes - first));
-            gRingWr += (unsigned long)bytes;
-            gPcmTotal += bytes;
-        }
-    }
-    if (used) {
-        gCompLen -= used;
-        if (gCompLen) memmove(gComp, gComp + used, gCompLen);
-    }
-
-    if (!gPlaying) {
-        unsigned long fill = gRingWr - gRingRd;
-        /* start at the prebuffer mark — or with whatever remains if the
-         * stream already died (play the tail out rather than sit on it) */
-        if (fill >= (unsigned long)CQ_AUD_PREBUF_PCM || (!gStream && fill > 0)) {
-            if (!StartDoubleBuffer()) StopAudio("output start failed");
-        }
+        unsigned long contig = 0;
+        unsigned char *dst = cq_decring_claim(&gDec, &contig);
+        size_t n;
+        if (!contig) break;                    /* comp ring full: backpressure */
+        n = cq_tx_drain(gStream, dst, (size_t)contig);
+        if (!n) break;
+        cq_decring_commit(&gDec, (unsigned long)n);
+        gRxTotal += (long)n;
+        /* The first ~12 KB, drain by drain: an impatience-proof rate read.
+         * (VM tests keep getting toggled off within seconds — b16/b17.) */
+        if (gRxTotal <= 12288)
+            DbgLog("audio: rx +%ld (total %ld)", (long)n, gRxTotal);
     }
 }
 
@@ -1498,10 +1462,14 @@ static void ServiceAudio(void)
 {
     if (gAuSt == AU_IDLE) return;
 
-    /* 1) the wire: poll, drain into staging, note death */
+    /* 1) the wire: poll, drain, note death. Pre-play the bytes stage in gComp
+     * (header strip + sync need a flat window); once playing they feed the
+     * comp ring, whose backpressure replaces the old staging-full check. */
     if (gStream) {
         cq_tx_status st = cq_tx_poll(gStream);
-        if (gCompLen < sizeof(gComp)) {
+        if (gAuSt == AU_PLAY) {
+            DrainStreamToDec();
+        } else if (gCompLen < sizeof(gComp)) {
             size_t n = cq_tx_drain(gStream, gComp + gCompLen, sizeof(gComp) - gCompLen);
             gCompLen += n;
             gRxTotal += (long)n;
@@ -1513,10 +1481,18 @@ static void ServiceAudio(void)
         if (st != CQ_TX_RUNNING) {
             DbgLog("audio: stream %s", st == CQ_TX_DONE ? "closed by server"
                                                         : cq_tx_error_message(gStream));
-            if (gCompLen < sizeof(gComp))       /* last drain of the buffered tail */
-                gCompLen += cq_tx_drain(gStream, gComp + gCompLen, sizeof(gComp) - gCompLen);
-            cq_tx_free(gStream); gStream = NULL;
-            if (gAuSt != AU_PLAY) { StopAudio("stream died before playback"); return; }
+            if (gAuSt == AU_PLAY) {
+                DrainStreamToDec();             /* last drain of the buffered tail */
+                cq_tx_free(gStream); gStream = NULL;
+                cq_decring_eof(&gDec);          /* let the pump flush the held
+                                                   final frame (b26 gate 2 -> 1) */
+            } else {
+                if (gCompLen < sizeof(gComp))   /* last drain of the buffered tail */
+                    gCompLen += cq_tx_drain(gStream, gComp + gCompLen, sizeof(gComp) - gCompLen);
+                cq_tx_free(gStream); gStream = NULL;
+                StopAudio("stream died before playback");
+                return;
+            }
         }
     }
 
@@ -1556,16 +1532,53 @@ static void ServiceAudio(void)
             memmove(gComp, gComp + off, gCompLen);
             if (!OpenAudioOutput()) { StopAudio("output open failed"); return; }
             gAuSt = AU_PLAY;
+            {   /* hand the synced remainder to the decode pipeline; the comp
+                 * ring (256 KB) dwarfs this staging (64 KB), so it all fits */
+                size_t done = 0;
+                while (done < gCompLen) {
+                    unsigned long contig = 0;
+                    unsigned char *dst = cq_decring_claim(&gDec, &contig);
+                    if (!contig) break;
+                    if ((size_t)contig > gCompLen - done)
+                        contig = (unsigned long)(gCompLen - done);
+                    memcpy(dst, gComp + done, (size_t)contig);
+                    cq_decring_commit(&gDec, contig);
+                    done += (size_t)contig;
+                }
+                gCompLen = 0;
+            }
         } else if (gCompLen > 32 * 1024) {
             StopAudio("no MP3 frame in 32 KB");
             return;
         }
     }
 
-    /* 4) playback: decode into the ring; drained-out = done */
+    /* 4) playback: pump the decode pipeline; drained-out = done. b51 pumps
+     * inline (same behavior as ever); b52 moves this call to the MP task. */
     if (gAuSt == AU_PLAY) {
-        PumpRing();
-        if (gAuSt != AU_PLAY) return;   /* the pump may give up and stop */
+        cq_decring_pump(&gDec);
+        {   /* narrate the pump's mailbox (the module may not DbgLog — it has
+             * to stay legal on an MP task) */
+            if (gDec.resyncs != gDecResSeen) {
+                gDecResSeen = gDec.resyncs;
+                DbgLog("audio: resync x%ld (%ld B splice junk dropped)",
+                       gDec.resyncs, gDec.resync_bytes);
+            }
+            if (gDec.flushes != gDecFluSeen) {
+                gDecFluSeen = gDec.flushes;
+                DbgLog("audio: staging unparseable, flushed (x%ld)", gDec.flushes);
+            }
+        }
+        if (!gPlaying) {
+            unsigned long fill = gRingWr - gRingRd;
+            /* start at the prebuffer mark — or with whatever remains if the
+             * stream already died (play the tail out rather than sit on it).
+             * SndPlayDoubleBuffer is Toolbox: this decision stays on main. */
+            if (fill >= (unsigned long)CQ_AUD_PREBUF_PCM || (!gStream && fill > 0)) {
+                if (!StartDoubleBuffer()) StopAudio("output start failed");
+            }
+        }
+        if (gAuSt != AU_PLAY) return;   /* the start may give up and stop */
         {   /* status tells (b45): starvation (interrupt served silence) and
              * a dry mount (rx parked while playing = Spotify isn't sending;
              * the right lever is Play/Wake, not Listen). */
@@ -1597,7 +1610,7 @@ static void ServiceAudio(void)
                        (long)((fill - CQ_AUD_RING_TARGET) / 1024));
             }
         }
-        if (!gStream && gCompLen == 0 && gPlaying && gRingWr == gRingRd) {
+        if (!gStream && cq_decring_idle(&gDec) && gPlaying && gRingWr == gRingRd) {
             StopAudio("played out");
             return;
         }
@@ -1617,9 +1630,10 @@ static void ServiceAudio(void)
                 cq_tx_udp_stats(&uok, &ufail, &uerr);
                 DbgLog("audio: playing, ring %ld KB, fires %ld, sil %ld, trims %ld, dec %ldf/%ldt, pcm %ldK, %ld staged, %ld rx, udp %ld/%ld e%ld",
                        (long)((gRingWr - gRingRd) / 1024),
-                       gDBFires, gDBSilence, gTrims, gDecFrames, gDecTicks,
-                       gPcmTotal / 1024, (long)gCompLen, gRxTotal,
-                       uok, ufail, uerr);
+                       gDBFires, gDBSilence, gTrims, gDec.frames,
+                       (long)gDec.dec_time, gDec.pcm_total / 1024,
+                       (long)(gDec.comp_wr - gDec.comp_rd + gDec.stage_len),
+                       gRxTotal, uok, ufail, uerr);
             }
         }
     } else if ((unsigned long)TickCount() - gAuBeat >= 300) {   /* pre-play: ~5 s */
