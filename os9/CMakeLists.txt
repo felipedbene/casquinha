@@ -38,6 +38,8 @@ target_link_libraries(Casquinha
     TextCommon
     QuickTimeLib           # GraphicsImporter cover-art decode (Fio 5)
     SoundLib               # SndChannel + SoundConverter (⌘T audio, b16)
+    MPLibrary              # preemptive tasks (exp/mp-decode, b50 smoke probe)
+    DriverServicesLib      # UpTime/AddDurationToAbsolute for MP task pacing
 )
 
 # The MP3 decoder must OUTRUN realtime on an emulated PPC (38 frames/s at

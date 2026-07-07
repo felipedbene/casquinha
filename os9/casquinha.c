@@ -40,6 +40,8 @@
 #include <Gestalt.h>
 #include <AppleEvents.h>
 #include <AERegistry.h>
+#include <Multiprocessing.h>
+#include <DriverServices.h>
 
 #include <string.h>
 #include <stdio.h>
@@ -72,7 +74,7 @@ enum {
     kQuitItem    = 3     /* Preferences, -, Quit */
 };
 
-#define CQ_BUILD_TAG "b49"  /* bump on every VM-iteration build (see status row,
+#define CQ_BUILD_TAG "b50"  /* bump on every VM-iteration build (see status row,
                              * the share filenames, and the per-build log name) */
 #define CQ_DEFAULT_HOST "10.0.100.112"  /* server address is a pref (Fio 6) */
 #define CQ_DEFAULT_PORT 70
@@ -107,7 +109,6 @@ static int           gLastStat  = -1;    /* last cq_tx_status seen */
 static int           gLastErr   = 0;     /* last cq_tx_error code */
 static long          gLastLen   = 0;     /* bytes of last reply */
 static char          gLastMsg[128] = "";
-static unsigned long gLastDraw  = 0;
 
 /* Audio status line (b45) — defined with the audio engine, drawn in the
  * player's status row so the silent phases (tuning/prebuffer/dry mount)
@@ -2068,6 +2069,190 @@ static void DoMouseDown(EventRecord *ev)
     }
 }
 
+/* --- MP smoke probe (b50, exp/mp-decode phase 0) ------------------------
+ * Before any audio surgery: prove Multiprocessing Services schedules a
+ * preemptive task under UTM/QEMU OS 9 — INCLUDING while the cooperative
+ * loop is frozen inside MenuSelect. The task only bumps a counter (~200/s);
+ * the heartbeat log brackets a menu hold, so the first post-release delta
+ * shows whether it kept counting while WaitNextEvent starved. If it did,
+ * the decoder can live there and the ring survives menus; if not, the
+ * experiment dies here for the price of one build.
+ * MP tasks get NO Toolbox, NO Memory Manager, NO Open Transport. */
+static int                    gMPOk        = 0;    /* MPLibraryIsLoaded() at boot */
+static MPTaskID               gMPProbeTask = NULL;
+static MPQueueID              gMPProbeQ    = NULL; /* termination notifications */
+static volatile unsigned long gMPBeat      = 0;    /* task writes, main reads */
+static volatile long          gMPProbeQuit = 0;    /* main writes, task reads */
+
+static OSStatus MPProbeProc(void *param)
+{
+    AbsoluteTime wake;
+    (void)param;
+    while (!gMPProbeQuit) {
+        gMPBeat++;
+        wake = AddDurationToAbsolute(5 * kDurationMillisecond, UpTime());
+        MPDelayUntil(&wake);
+    }
+    return noErr;                 /* task exit posts to gMPProbeQ */
+}
+
+static void StartMPProbe(void)
+{
+    OSStatus err;
+    if (!gMPOk) return;
+    err = MPCreateQueue(&gMPProbeQ);
+    if (err == noErr)
+        err = MPCreateTask(MPProbeProc, NULL, 32 * 1024, gMPProbeQ,
+                           NULL, NULL, 0, &gMPProbeTask);
+    if (err != noErr) {
+        DbgLog("mp: probe task failed (err=%ld)", (long)err);
+        if (gMPProbeQ) { MPDeleteQueue(gMPProbeQ); gMPProbeQ = NULL; }
+        gMPProbeTask = NULL;
+        return;
+    }
+    DbgLog("mp: probe task up (%ld cpu)", (long)MPProcessors());
+}
+
+static void StopMPProbe(void)
+{
+    void *p1, *p2, *p3;
+    if (!gMPProbeTask) return;
+    gMPProbeQuit = 1;             /* task exits its loop within ~5 ms */
+    if (MPWaitOnQueue(gMPProbeQ, &p1, &p2, &p3,
+                      1000 * kDurationMillisecond) != noErr) {
+        DbgLog("mp: probe join timeout, terminating");
+        MPTerminateTask(gMPProbeTask, noErr);
+        MPWaitOnQueue(gMPProbeQ, &p1, &p2, &p3, 1000 * kDurationMillisecond);
+    }
+    MPDeleteQueue(gMPProbeQ);
+    gMPProbeQ = NULL;
+    gMPProbeTask = NULL;
+    DbgLog("mp: probe down, %lu beats", gMPBeat);
+}
+
+static void TickMPProbe(void)
+{
+    static unsigned long lastLog = 0, lastBeat = 0;
+    unsigned long now;
+    if (!gMPProbeTask) return;
+    now = (unsigned long)TickCount();
+    if (now - lastLog >= 300) {   /* ~5 s cadence; the delta spanning a menu
+                                   * hold is the whole experiment */
+        DbgLog("mp: beat %lu (+%lu)", gMPBeat, gMPBeat - lastBeat);
+        lastBeat = gMPBeat;
+        lastLog  = now;
+    }
+}
+
+/* --- the cooperative loop, decomposed (b50) ------------------------------
+ * main()'s while stays the only clock; these are its limbs, extracted
+ * verbatim so the loop body reads as the schedule it actually is. */
+
+/* Short sleep while a fetch is in flight (spin the OT state machine),
+ * calmer when idle between polls, calmer still suspended in the
+ * background — unless audio is playing, which wants regular service. */
+static long ComputeSleep(void)
+{
+    return gTx ? 1L : ((gSuspended && gAuSt == AU_IDLE) ? 60L : 10L);
+}
+
+static void HandleEvent(EventRecord *ev)
+{
+    switch (ev->what) {
+        case mouseDown:
+            DoMouseDown(ev);
+            break;
+        case keyDown:
+        case autoKey: {
+            char ch = (char)(ev->message & charCodeMask);
+            if (ev->modifiers & cmdKey) {
+                /* Hand-rolled shortcuts (b30): these actions left the
+                 * menu (menu tracking starves the audio ring) but keep
+                 * their keys. Everything else -> MenuKey (Prefs/Quit). */
+                if (ch == 'f' || ch == 'F') {
+                    if (gSearchEdit)
+                        SetKeyboardFocus(gWindow, gSearchEdit,
+                                         kControlFocusNextPart);
+                } else if (ch == 't' || ch == 'T') {
+                    ToggleListen();
+                } else if (ch == 'k' || ch == 'K') {
+                    StartCommand("/spot/api/1/wake?play=1");
+                } else if (ch == 'u' || ch == 'U') {
+                    gQueueKick = (unsigned long)TickCount();  /* refresh now */
+                } else {
+                    DoMenu(MenuKey(ch));
+                }
+            } else {
+                ControlHandle focus = NULL;
+                GetKeyboardFocus(gWindow, &focus);
+                if (focus && focus == gSearchEdit) {
+                    if (ch == '\r' || ch == '\n') RunSearch();
+                    else {
+                        /* Same port trap as IdleControls: HandleControlKey
+                         * draws the typed character into the CURRENT
+                         * port — pin it to the window. */
+                        GrafPtr save;
+                        GetPort(&save);
+                        SetPort((GrafPtr)gWindow);
+                        HandleControlKey(gSearchEdit,
+                             (short)((ev->message & keyCodeMask) >> 8), ch, ev->modifiers);
+                        SetPort(save);
+                    }
+                }
+            }
+            break;
+        }
+        case updateEvt: {
+            WindowRef win = (WindowRef)ev->message;
+            BeginUpdate(win);
+            if (win == gWindow) {
+                DrawWindowContents(win);          /* the player area */
+                DrawShelf(win);                   /* separator/labels/frames */
+                UpdateControls(win, ((GrafPtr)win)->visRgn);
+                if (gSearchList) LUpdate(((GrafPtr)win)->visRgn, gSearchList);
+                if (gQueueList)  LUpdate(((GrafPtr)win)->visRgn, gQueueList);
+            }
+            EndUpdate(win);
+            break;
+        }
+        case osEvt:
+            /* Suspend/resume (Fio C; SIZE has acceptSuspendResumeEvents):
+             * in the background no NEW polls start (PollNetwork/PumpAux
+             * check gSuspended) — in-flight transactions still drain and
+             * ⌘T audio plays on. Resume kicks an immediate /now. */
+            if (((ev->message >> 24) & 0xFF) == suspendResumeMessage) {
+                gSuspended = (ev->message & resumeFlag) == 0;
+                if (!gSuspended) gLastPoll = 0;
+            }
+            break;
+        case kHighLevelEvent:
+            AEProcessAppleEvent(ev);   /* quit + do script (b36) */
+            break;
+        default:
+            break;
+    }
+}
+
+static void TickCaret(void)
+{
+    GrafPtr save;
+    if (!gWindow) return;
+    /* IdleControls draws into the CURRENT port — pin it to the window
+     * or the caret lands wherever the last draw left the port. */
+    GetPort(&save);
+    SetPort((GrafPtr)gWindow);
+    IdleControls(gWindow);
+    SetPort(save);
+}
+
+static void TickDiagnostics(void)
+{
+    /* animate the diagnostics ~2x/sec so it's visible the loop is alive */
+    static unsigned long lastDraw = 0;
+    unsigned long now = (unsigned long)TickCount();
+    if (now - lastDraw >= 30) { lastDraw = now; Redraw(); }
+}
+
 int main(void)
 {
     EventRecord ev;
@@ -2090,12 +2275,14 @@ int main(void)
     RegisterAppearanceClient();               /* opt into the Platinum look */
 
     gQTOk = (EnterMovies() == noErr);         /* QuickTime for cover-art decode */
-    {   /* boot line: which build, and exactly which QuickTime is under us */
+    gMPOk = MPLibraryIsLoaded();              /* preemptive tasks available? (b50) */
+    {   /* boot line: which build, and exactly which QuickTime/MP is under us */
         long qtv = 0;
         Gestalt(gestaltQuickTimeVersion, &qtv);
-        DbgLog("boot %s  QT=%s ver=%08lx", CQ_BUILD_TAG,
-               gQTOk ? "ok" : "MISSING", qtv);
+        DbgLog("boot %s  QT=%s ver=%08lx  MP=%s", CQ_BUILD_TAG,
+               gQTOk ? "ok" : "MISSING", qtv, gMPOk ? "yes" : "no");
     }
+    StartMPProbe();                           /* b50 smoke probe (no-op if MP=no) */
 
     {   /* converters: UTF-8 -> MacRoman (draw) and MacRoman -> UTF-8 (wire) */
         TextEncoding utf8 = CreateTextEncoding(kTextEncodingUnicodeV2_0,
@@ -2149,103 +2336,16 @@ int main(void)
     }
 
     while (gRunning) {
-        /* Short sleep while a fetch is in flight (spin the OT state machine),
-         * calmer when idle between polls, calmer still suspended in the
-         * background — unless audio is playing, which wants regular service. */
-        long sleep = gTx ? 1L : ((gSuspended && gAuSt == AU_IDLE) ? 60L : 10L);
-        if (WaitNextEvent(everyEvent, &ev, sleep, NULL)) {
-            switch (ev.what) {
-                case mouseDown:
-                    DoMouseDown(&ev);
-                    break;
-                case keyDown:
-                case autoKey: {
-                    char ch = (char)(ev.message & charCodeMask);
-                    if (ev.modifiers & cmdKey) {
-                        /* Hand-rolled shortcuts (b30): these actions left the
-                         * menu (menu tracking starves the audio ring) but keep
-                         * their keys. Everything else -> MenuKey (Prefs/Quit). */
-                        if (ch == 'f' || ch == 'F') {
-                            if (gSearchEdit)
-                                SetKeyboardFocus(gWindow, gSearchEdit,
-                                                 kControlFocusNextPart);
-                        } else if (ch == 't' || ch == 'T') {
-                            ToggleListen();
-                        } else if (ch == 'k' || ch == 'K') {
-                            StartCommand("/spot/api/1/wake?play=1");
-                        } else if (ch == 'u' || ch == 'U') {
-                            gQueueKick = (unsigned long)TickCount();  /* refresh now */
-                        } else {
-                            DoMenu(MenuKey(ch));
-                        }
-                    } else {
-                        ControlHandle focus = NULL;
-                        GetKeyboardFocus(gWindow, &focus);
-                        if (focus && focus == gSearchEdit) {
-                            if (ch == '\r' || ch == '\n') RunSearch();
-                            else {
-                                /* Same port trap as IdleControls: HandleControlKey
-                                 * draws the typed character into the CURRENT
-                                 * port — pin it to the window. */
-                                GrafPtr save;
-                                GetPort(&save);
-                                SetPort((GrafPtr)gWindow);
-                                HandleControlKey(gSearchEdit,
-                                     (short)((ev.message & keyCodeMask) >> 8), ch, ev.modifiers);
-                                SetPort(save);
-                            }
-                        }
-                    }
-                    break;
-                }
-                case updateEvt: {
-                    WindowRef win = (WindowRef)ev.message;
-                    BeginUpdate(win);
-                    if (win == gWindow) {
-                        DrawWindowContents(win);          /* the player area */
-                        DrawShelf(win);                   /* separator/labels/frames */
-                        UpdateControls(win, ((GrafPtr)win)->visRgn);
-                        if (gSearchList) LUpdate(((GrafPtr)win)->visRgn, gSearchList);
-                        if (gQueueList)  LUpdate(((GrafPtr)win)->visRgn, gQueueList);
-                    }
-                    EndUpdate(win);
-                    break;
-                }
-                case osEvt:
-                    /* Suspend/resume (Fio C; SIZE has acceptSuspendResumeEvents):
-                     * in the background no NEW polls start (PollNetwork/PumpAux
-                     * check gSuspended) — in-flight transactions still drain and
-                     * ⌘T audio plays on. Resume kicks an immediate /now. */
-                    if (((ev.message >> 24) & 0xFF) == suspendResumeMessage) {
-                        gSuspended = (ev.message & resumeFlag) == 0;
-                        if (!gSuspended) gLastPoll = 0;
-                    }
-                    break;
-                case kHighLevelEvent:
-                    AEProcessAppleEvent(&ev);   /* quit + do script (b36) */
-                    break;
-                default:
-                    break;
-            }
-        }
-        PollNetwork();
-        PumpAux();
-        if (gWindow) {   /* blink the search caret */
-            /* IdleControls draws into the CURRENT port — pin it to the window
-             * or the caret lands wherever the last draw left the port. */
-            GrafPtr save;
-            GetPort(&save);
-            SetPort((GrafPtr)gWindow);
-            IdleControls(gWindow);
-            SetPort(save);
-        }
-
-        {   /* animate the diagnostics ~2x/sec so it's visible the loop is alive */
-            unsigned long now = (unsigned long)TickCount();
-            if (now - gLastDraw >= 30) { gLastDraw = now; Redraw(); }
-        }
+        if (WaitNextEvent(everyEvent, &ev, ComputeSleep(), NULL))
+            HandleEvent(&ev);
+        PollNetwork();       /* /now poll + command/cover/debounce pumps */
+        PumpAux();           /* fire/pls/search/queue pumps + ServiceAudio */
+        TickCaret();         /* blink the search caret (port-pinned) */
+        TickDiagnostics();   /* ~2x/sec status animation */
+        TickMPProbe();       /* b50: preemptive-task liveness heartbeat */
     }
 
+    StopMPProbe();
     StopAudio("quit");
     if (gLogRef) { DbgLog("quit"); FSClose(gLogRef); gLogRef = 0; }
     if (gTx) { cq_tx_cancel(gTx); cq_tx_free(gTx); }
