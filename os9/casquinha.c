@@ -75,7 +75,7 @@ enum {
     kQuitItem    = 3     /* Preferences, -, Quit */
 };
 
-#define CQ_BUILD_TAG "b52"  /* bump on every VM-iteration build (see status row,
+#define CQ_BUILD_TAG "b55"  /* bump on every VM-iteration build (see status row,
                              * the share filenames, and the per-build log name) */
 #define CQ_DEFAULT_HOST "10.0.100.112"  /* server address is a pref (Fio 6) */
 #define CQ_DEFAULT_PORT 70
@@ -1209,11 +1209,12 @@ typedef enum { AU_IDLE = 0, AU_HTTP, AU_SYNC, AU_PLAY } au_state;
  * Radio physics (b23): a live mount arrives at exactly playback rate, so the
  * cushion never grows on its own — it is BUILT, up front: ~5 s of decoded
  * PCM before the first note. Startup latency IS the freeze immunity. */
-#define CQ_AUD_RING_BYTES (1536L * 1024L)  /* ~8.7 s of 44.1 kHz stereo 16-bit */
+#define CQ_AUD_RING_BYTES (2048L * 1024L)  /* ~11.9 s of 44.1 kHz stereo 16-bit */
 #define CQ_AUD_CHUNK      (32L * 1024L)    /* per double-buffer refill (~0.19 s) */
-/* Latency knobs (b29/b31): the backlog IS both the command→ear delay and the
- * freeze/dry-spell immunity — one buys the other. The server side
- * (librespot→Icecast) adds its own ~1-2 s floor that no client knob removes.
+/* Latency knobs (b29/b31, repriced in b53): the backlog IS both the
+ * command→ear delay and the freeze/dry-spell immunity — one buys the other.
+ * The server side (librespot→Icecast) adds its own ~1-2 s floor that no
+ * client knob removes.
  *
  * b31 lesson: b29's "stop decoding at the target" cap did NOT cap latency —
  * the backlog just moved upstream into the staging (4 s) and transport (4 s)
@@ -1221,8 +1222,21 @@ typedef enum { AU_IDLE = 0, AU_HTTP, AU_SYNC, AU_PLAY } au_state;
  * runs (the whole backlog lives IN the ring, where it can be measured) and
  * excess beyond target+slack is SKIPPED — a one-shot jump-cut back toward
  * the live edge, applied by the interrupt so the read cursor has exactly one
- * writer. Normal fill (~prebuffer) sits below the trim threshold, so trims
- * only fire after freeze/dry-spell catch-ups. */
+ * writer.
+ *
+ * b53-b55, the deep-cushion experiment (design/CUSHION-PHYSICS.md has the
+ * full post-mortem): with the decoder preemptive (b52) we tried holding
+ * ~7.4 s of backlog as freeze immunity and jump-cutting to the live edge on
+ * transport commands. Both cut triggers failed in the field — cut-on-send
+ * (b53) jumps audibly when the command no-ops upstream (b37 dead context);
+ * cut-on-confirmation (b54) misattributes NATURAL track flips that race a
+ * pending command, stealing the very transition the listener was about to
+ * hear (with a deep cushion, /now flips ~cushion seconds before the ear).
+ * Underneath sits a conservation law: ear-lag == cushion — deep freeze
+ * immunity and fast command response cannot coexist at one instant. b55
+ * returns to the b31-proven shallow target; what the experiment KEEPS is the
+ * preemptive decoder (instant catch-up, no decode-stop during freezes) and
+ * the server-side queue-size (no more slow-client disconnects). */
 #define CQ_AUD_PREBUF_PCM  (384L * 1024L)  /* ~2.2 s decoded before starting */
 #define CQ_AUD_RING_TARGET (512L * 1024L)  /* trim back to ~2.9 s of backlog */
 #define CQ_AUD_TRIM_SLACK  (256L * 1024L)  /* +1.5 s hysteresis before trimming */
