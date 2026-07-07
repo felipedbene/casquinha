@@ -51,6 +51,7 @@
 #include "cq_codec.h"
 #include "cq_now.h"
 #include "cq_guard.h"
+#include "cq_view.h"
 #include "cq_backoff.h"
 #include "cq_cache.h"
 #include "cq_debounce.h"
@@ -75,7 +76,7 @@ enum {
     kQuitItem    = 3     /* Preferences, -, Quit */
 };
 
-#define CQ_BUILD_TAG "b55"  /* bump on every VM-iteration build (see status row,
+#define CQ_BUILD_TAG "b56"  /* bump on every VM-iteration build (see status row,
                              * the share filenames, and the per-build log name) */
 #define CQ_DEFAULT_HOST "10.0.100.112"  /* server address is a pref (Fio 6) */
 #define CQ_DEFAULT_PORT 70
@@ -111,18 +112,48 @@ static int           gLastErr   = 0;     /* last cq_tx_error code */
 static long          gLastLen   = 0;     /* bytes of last reply */
 static char          gLastMsg[128] = "";
 
-/* Audio status line (b45) — defined with the audio engine, drawn in the
- * player's status row so the silent phases (tuning/prebuffer/dry mount)
- * read as WORK IN PROGRESS instead of "broken", which is what made users
- * re-click (and a second Listen click is a Stop). */
-static void AudioStatusStr(char *out, size_t cap);
+/* The view (fio B): every word the player area shows — state word, the radio
+ * status readout (b45/b49), the command ack (b48), the interpolated progress
+ * — is rendered by the PURE cq_view module from one input struct; this glue
+ * only gathers inputs and draws the output. gView is the last RENDERED truth
+ * (Redraw re-renders before painting, so the screen never mixes clocks). */
+static cq_view       gView;
 
-/* Transient command acknowledgment (b48): clicking Next gave no visible
- * reaction for up to ~7 s (debounce + poll flip + radio latency), so users
- * doubted the click landed. Shown in place of the state word until the
- * track actually changes (or an 8 s timeout). */
-static char          gTransMsg[24] = "";
-static unsigned long gTransUntil = 0;
+/* The pending transport command (b48, generalized in fio B): captured at the
+ * gesture, cleared when the snapshot reflects it or the 8 s settle window
+ * times out — cq_view computes both; the glue just drops the note. */
+static struct {
+    cq_intent_kind kind;
+    unsigned long  ticks;
+    char           pre_track_id[24];
+    cq_play_state  pre_state;
+} gIntent;
+
+static void SetIntent(cq_intent_kind kind)
+{
+    gIntent.kind  = kind;
+    gIntent.ticks = (unsigned long)TickCount();
+    gIntent.pre_track_id[0] = '\0';
+    if (gHaveSnap && gSnap.track_id) {
+        strncpy(gIntent.pre_track_id, gSnap.track_id,
+                sizeof(gIntent.pre_track_id) - 1);
+        gIntent.pre_track_id[sizeof(gIntent.pre_track_id) - 1] = '\0';
+    }
+    gIntent.pre_state = gHaveSnap ? gSnap.state : CQ_STATE_STOPPED;
+}
+
+/* The media plane's own fact (fio B / server fio A1): /spot/api/1/stream says
+ * whether the Icecast mount carries real audio. Feature-detected ONCE per
+ * launch (CLIENTS.md rule 24): 0 = unprobed, 1 = server has it, -1 =
+ * not_found (old server — stop asking, cq_view keeps its rx heuristic). */
+static cq_transport *gFactTx      = NULL;
+static int           gStreamProbe = 0;
+static int           gHaveFact    = 0;
+static int           gFactLive    = 0;
+static long long     gFactTs      = 0;
+static unsigned long gFactLast    = 0;   /* last fetch tick */
+static cq_backoff    gFBackoff;          /* lazy cadence, backs off on errors */
+#define CQ_STREAM_POLL_TICKS 600         /* 10 s — a slow-moving fact (rule 23) */
 
 /* --- debug log: OPT-IN via a marker file (b42). When a file named
  * "Casquinha Debug" sits next to the app, every DbgLog line goes to
@@ -382,7 +413,7 @@ static void DrawWindowContents(WindowRef win)
 
     /* Track title — bold system font; green when actually playing. */
     TextFont(0); TextFace(bold); TextSize(14);
-    if (gSnap.state == CQ_STATE_PLAYING && gIsColor) {
+    if (gView.title_green && gIsColor) {
         RGBColor green = { 7453, 47545, 21588 }, save;
         GetForeColor(&save); RGBForeColor(&green);
         DrawCStr(16, 58, gSnap.track ? gSnap.track : "(no track)");
@@ -399,18 +430,13 @@ static void DrawWindowContents(WindowRef win)
     DrawCStr(16, 78, gSnap.artist ? gSnap.artist : "");
     DrawCStr(16, 94, gSnap.album  ? gSnap.album  : "");
 
-    /* Progress bar — native themed track, interpolated between polls. */
+    /* Progress bar — native themed track; the interpolation (and its clamp)
+     * is cq_view's, computed with the same clock as everything else drawn. */
     {
-        long posMs = (long)gSnap.position_ms;
-        long durMs = (long)gSnap.duration_ms;
-        if (gSnap.state == CQ_STATE_PLAYING) {
-            long elapsed = (long)(((TickCount() - gSnapTick) * 1000L) / 60L);
-            posMs += elapsed;
-        }
-        if (posMs < 0) posMs = 0;
-        if (durMs > 0 && posMs > durMs) posMs = durMs;
+        long posMs = (long)gView.position_ms;
+        long durMs = (long)gView.duration_ms;
 
-        if (durMs > 0) {
+        if (gView.show_progress) {
             ThemeTrackDrawInfo info;
             SetRect(&info.bounds, 16, 108, W - 16, 124);
             info.kind        = kThemeProgressBar;
@@ -440,36 +466,23 @@ static void DrawWindowContents(WindowRef win)
     ThemeText(kThemeTextColorDialogActive);
     /* CQ_BUILD_TAG: bumped per VM-iteration build so it's provable WHICH binary
      * is running over there (stale copies on the netatalk share bite). */
-    {   /* state word — or the transient command ack ("Skipping...", b48):
-         * a click must visibly land NOW, not after the poll+radio latency */
-        const char *stateWord;
-        if (gTransMsg[0] &&
-            (long)((unsigned long)TickCount() - gTransUntil) < 0) {
-            stateWord = gTransMsg;
-        } else {
-            gTransMsg[0] = '\0';
-            stateWord = gSnap.state == CQ_STATE_PLAYING ? "Playing" :
-                        gSnap.state == CQ_STATE_PAUSED  ? "Paused"  : "Stopped";
-        }
-        snprintf(line, sizeof(line), "%s      %s      [%s]",
-                 stateWord,
-                 gSnap.device == CQ_DEV_ACTIVE ? "on gopher-spot" :
-                 gSnap.device == CQ_DEV_IDLE   ? "playing elsewhere" : "",
-                 CQ_BUILD_TAG);
-    }
+    /* State word — or the pending-command ack ("Skipping...", b48): both are
+     * cq_view's call now, from the same render as everything else drawn. */
+    snprintf(line, sizeof(line), "%s      %s      [%s]",
+             gView.state_word,
+             gSnap.device == CQ_DEV_ACTIVE ? "on gopher-spot" :
+             gSnap.device == CQ_DEV_IDLE   ? "playing elsewhere" : "",
+             CQ_BUILD_TAG);
     DrawCStr(16, 202, line);
 
-    {   /* the audio engine narrating itself, right-aligned on the same row;
-         * the 2 Hz animator makes "Buffering... N%" tick up live (b45) */
-        char aud[48];
-        AudioStatusStr(aud, sizeof(aud));
-        if (aud[0]) DrawCStrRight(W - 16, 202, aud);
-    }
+    /* the engine narrating itself, right-aligned on the same row (b45/b49 —
+     * the vocabulary lives in cq_view; TickView animates the count-up) */
+    if (gView.status[0]) DrawCStrRight(W - 16, 202, gView.status);
 
     /* Album cover (Fio 5), top-right, drawn last so it sits above the text.
-     * Looked up by the CURRENT album_id — never a stale neighbor's cover. */
-    if (gSnap.album_id) {
-        GWorldPtr gw = (GWorldPtr)cq_cache_get(&gCovers, gSnap.album_id);
+     * Looked up by the view's ONE key — never a stale neighbor's cover. */
+    if (gView.cover_key[0]) {
+        GWorldPtr gw = (GWorldPtr)cq_cache_get(&gCovers, gView.cover_key);
         if (gw) {
             PixMapHandle pm = GetGWorldPixMap(gw);
             Rect sr, dr;
@@ -527,8 +540,14 @@ static void DrawShelf(WindowRef win)
     }
 }
 
+/* Re-render the view, then paint: every repaint draws ONE render's output,
+ * so the state word, status readout, ack and progress can never mix clocks.
+ * (RenderView lives with the audio globals it reads, below.) */
+static void RenderView(void);
+
 static void Redraw(void)
 {
+    RenderView();
     if (gWindow) DrawWindowContents(gWindow);
 }
 
@@ -680,17 +699,22 @@ static void AdoptReply(const unsigned char *d, size_t len, int isCmd)
             if (tmp.track_id && (!gSnap.track_id ||
                                  strcmp(tmp.track_id, gSnap.track_id) != 0)) {
                 gQueueKick = (unsigned long)TickCount() + 120;
-                gTransMsg[0] = '\0';           /* the skip landed (b48) */
+                /* (the skip ack clears itself: cq_view sees the reflection) */
                 /* the UI-flip moment, timestamped: ear-vs-UI staleness at
                  * natural transitions is measurable from the log sink (b44) */
                 DbgLog("now: %s - %s",
                        tmp.track  ? tmp.track  : "?",
                        tmp.artist ? tmp.artist : "?");
             }
-            cq_now_free(&gSnap);
-            gSnap = tmp;
-            gHaveSnap = true;
-            gSnapTick = (unsigned long)TickCount();
+            {   /* Equal-ts re-adoption is a NO-OP for the progress anchor: a
+                 * cache-window poll re-serves the same document, and moving
+                 * the anchor rewound the bar ~2 s (fio A1 audit finding). */
+                int sameTs = gHaveSnap && tmp.ts > 0 && tmp.ts == gSnap.ts;
+                cq_now_free(&gSnap);
+                gSnap = tmp;
+                gHaveSnap = true;
+                if (!sameTs) gSnapTick = (unsigned long)TickCount();
+            }
             gLastMsg[0] = '\0';
             if (volHeld && gHaveSnap) gSnap.volume = keepVol;    /* don't yank a live drag */
             UpdatePlayTitle();
@@ -713,6 +737,7 @@ static void AdoptReply(const unsigned char *d, size_t len, int isCmd)
                         DbgLog("auto: already playing on gopher-spot");
                     } else if (gSnap.state == CQ_STATE_PAUSED) {
                         DbgLog("auto: resume on launch (paused on device)");
+                        SetIntent(CQ_INTENT_PLAY);
                         StartCommand("/spot/api/1/play");
                     } else {
                         DbgLog("auto: stopped on device - queue head once it loads");
@@ -721,6 +746,7 @@ static void AdoptReply(const unsigned char *d, size_t len, int isCmd)
                 } else {
                     DbgLog("auto: wake on launch (state=%d dev=%d)",
                            (int)gSnap.state, (int)gSnap.device);
+                    SetIntent(CQ_INTENT_PLAY);
                     StartCommand("/spot/api/1/wake?play=1");
                 }
             }
@@ -885,8 +911,7 @@ static void ToggleListen(void);
  * is playing and the visible queue has a head, play that head directly. */
 static void NextCommand(void)
 {
-    snprintf(gTransMsg, sizeof(gTransMsg), "Skipping...");   /* click landed (b48) */
-    gTransUntil = (unsigned long)TickCount() + 480;
+    SetIntent(CQ_INTENT_SKIP);   /* the click lands on screen NOW (b48) */
     if (gSnap.state != CQ_STATE_PLAYING) {
         int row = QueueNextRow();
         if (row >= 0) {
@@ -956,13 +981,14 @@ static void DoContentClick(WindowRef win, Point where)
         }
         if (TrackControl(ctl, where, NULL)) {
             if (ctl == gPrev) {              /* debounced (law 1) */
-                snprintf(gTransMsg, sizeof(gTransMsg), "Skipping...");
-                gTransUntil = (unsigned long)TickCount() + 480;
+                SetIntent(CQ_INTENT_SKIP);
                 cq_debounce_set(&gDeb, "/spot/api/1/prev");
                 gCmdFire = (unsigned long)TickCount() + CQ_DEBOUNCE_TICKS;
             } else if (ctl == gNext) {
                 NextCommand();               /* obeys the visible queue (b37) */
             } else if (ctl == gPlay) {       /* immediate toggle */
+                SetIntent(gSnap.state == CQ_STATE_PLAYING ?
+                          CQ_INTENT_PAUSE : CQ_INTENT_PLAY);
                 StartCommand(gSnap.state == CQ_STATE_PLAYING ?
                              "/spot/api/1/pause" : "/spot/api/1/play");
             } else if (ctl == gVol) {        /* commit on mouse-up, then hold (law 4) */
@@ -1275,8 +1301,12 @@ static volatile long  gRingSkip = 0;              /* one-shot latency trim reque
                                                     interrupt applies + zeroes it —
                                                     gRingRd keeps a single writer */
 static long           gTrims = 0;                 /* trims this listen */
-static unsigned long  gStarveUntil = 0;           /* show "Buffering" until this tick */
-static int            gMountDry = 0;              /* rx parked >3 s while playing */
+static unsigned long  gStarveTick = 0;            /* tick the interrupt last
+                                                     served silence; 0 = never
+                                                     this listen (view input) */
+static unsigned long  gRxTick = 0;                /* tick of the last stream
+                                                     byte (view input; the old
+                                                     gMountDry, now cq_view's) */
 static unsigned long  gAuBeat = 0;                /* heartbeat log tick */
 static long           gRxTotal = 0;               /* stream bytes received this listen */
 
@@ -1289,7 +1319,8 @@ static long           gRxTotal = 0;               /* stream bytes received this 
 static int TxInFlight(void)
 {
     return (gTx ? 1 : 0) + (gCmd ? 1 : 0) + (gCover ? 1 : 0) + (gFire ? 1 : 0) +
-           (gSearchTx ? 1 : 0) + (gQueueTx ? 1 : 0) + (gPls ? 1 : 0);
+           (gSearchTx ? 1 : 0) + (gQueueTx ? 1 : 0) + (gPls ? 1 : 0) +
+           (gFactTx ? 1 : 0);
 }
 
 static int ParseHttpUrl(const char *url, char *host, size_t hcap,
@@ -1497,8 +1528,8 @@ static void StopAudio(const char *why)
     gPlaying = 0;
     gRingWr = gRingRd = 0;
     gRingSkip = 0;
-    gStarveUntil = 0;
-    gMountDry = 0;
+    gStarveTick = 0;
+    gRxTick = 0;
 }
 
 /* First confirmed frame in hand: reset the decoder and arm the ring. The
@@ -1729,23 +1760,21 @@ static void ServiceAudio(void)
             }
         }
         if (gAuSt != AU_PLAY) return;   /* the start may give up and stop */
-        {   /* status tells (b45): starvation (interrupt served silence) and
-             * a dry mount (rx parked while playing = Spotify isn't sending;
-             * the right lever is Play/Wake, not Listen). */
-            static long          prevSil = 0;
-            static long          prevRx  = -1;
-            static unsigned long rxTick  = 0;
+        {   /* status-tell timestamps (b45): cq_view turns these into the
+             * "buffering..." starve window and the dry-mount heuristic —
+             * here we only note WHEN silence was served / rx last moved. */
+            static long prevSil = 0;
+            static long prevRx  = -1;
             unsigned long now = (unsigned long)TickCount();
             if (gDBSilence != prevSil) {
+                /* counters reset per listen while these statics survive:
+                 * only a real INCREMENT is a starve, a drop is a new listen */
+                if (gDBSilence > prevSil) gStarveTick = now;
                 prevSil = gDBSilence;
-                gStarveUntil = now + 120;            /* ~2 s of "Buffering..." */
             }
             if (gRxTotal != prevRx) {
                 prevRx = gRxTotal;
-                rxTick = now;
-                gMountDry = 0;
-            } else if (gStream && now - rxTick > 180) {
-                gMountDry = 1;
+                gRxTick = now;
             }
         }
         /* Latency trim (b31): backlog beyond target+slack means we fell
@@ -1807,35 +1836,65 @@ static void ServiceAudio(void)
     }
 }
 
-/* The engine narrating itself for the status row (b45). Empty = audio off. */
-static void AudioStatusStr(char *out, size_t cap)
+/* --- the view (fio B): gather → render → diff → draw ---------------------
+ * Every word the player area shows is cq_view's verdict over ONE input
+ * struct built here — the b45/b48/b49 vocabulary moved into the pure module
+ * where the host suite proves it; this glue only ferries state across. */
+static void BuildViewIn(cq_view_in *in)
 {
-    out[0] = '\0';
-    if (gAuSt == AU_IDLE) return;
-    if (gAuSt == AU_HTTP || gAuSt == AU_SYNC) {
-        snprintf(out, cap, "tuning in...");
-    } else if (!gPlaying) {
-        long pct = (long)(((gRingWr - gRingRd) * 100) /
-                          (unsigned long)CQ_AUD_PREBUF_PCM);
-        if (pct > 99) pct = 99;
-        snprintf(out, cap, "buffering... %ld%%", pct);
-    } else if (gSnap.state != CQ_STATE_PLAYING) {
-        /* upstream paused/stopped: "Paused ... on air" side by side read as
-         * a stale status (b49 field laugh). The truth in radio-speak: the
-         * ring's tail is still audible for ~3 s (radio latency), then we
-         * are tuned to a silent transmitter. */
-        if (gRingWr - gRingRd > (unsigned long)CQ_AUD_CHUNK)
-            snprintf(out, cap, "playing out...");
-        else
-            snprintf(out, cap, "standing by");
-    } else if (gMountDry) {
-        snprintf(out, cap, "waiting for Spotify...");   /* playing, yet rx dry: anomaly */
-    } else if ((long)((unsigned long)TickCount() - gStarveUntil) < 0) {
-        snprintf(out, cap, "buffering...");
-    } else {
-        /* radio vocabulary, lowercase — "Listening" read like the retired
-         * Listen toggle (b48 field report); "on air" is unmistakably status */
-        snprintf(out, cap, "on air");
+    unsigned long now = (unsigned long)TickCount();
+    memset(in, 0, sizeof(*in));
+    in->snap       = gHaveSnap ? &gSnap : NULL;
+    in->snap_ticks = gSnapTick;
+
+    in->has_stream_fact = (gStreamProbe == 1 && gHaveFact);
+    in->live            = gFactLive;
+    in->fact_ts         = gFactTs;
+
+    in->engine = gAuSt == AU_IDLE                     ? CQ_ENGINE_OFF :
+                 (gAuSt == AU_HTTP || gAuSt == AU_SYNC) ? CQ_ENGINE_TUNING :
+                 !gPlaying                            ? CQ_ENGINE_BUFFERING :
+                                                        CQ_ENGINE_ON_AIR;
+    in->ring_fill     = gRingWr - gRingRd;
+    in->prebuf_target = (unsigned long)CQ_AUD_PREBUF_PCM;
+    in->chunk_bytes   = (unsigned long)CQ_AUD_CHUNK;
+    in->rx_dry_ticks  = (gStream && gRxTick) ? (long)(now - gRxTick) : -1;
+    in->starve_ticks  = gStarveTick ? (long)(now - gStarveTick) : -1;
+
+    in->intent       = gIntent.kind;
+    in->intent_ticks = gIntent.ticks;
+    memcpy(in->pre_track_id, gIntent.pre_track_id, sizeof(in->pre_track_id));
+    in->pre_state    = gIntent.pre_state;
+
+    in->now_ticks = now;
+}
+
+static void RenderView(void)
+{
+    cq_view_in in;
+    BuildViewIn(&in);
+    cq_view_render(&gView, &in);
+    if (gIntent.kind != CQ_INTENT_NONE && !gView.ack_active)
+        gIntent.kind = CQ_INTENT_NONE;   /* reflected — or settle timed out */
+}
+
+/* Each loop pass: render, diff against the DRAWN truth, repaint only on a
+ * display-significant change (≤2 Hz — the b45 animator's ceiling, now
+ * change-driven: the buffering count-up and the second hand still tick). */
+static void TickView(void)
+{
+    static unsigned long lastDraw = 0;
+    unsigned long now = (unsigned long)TickCount();
+    cq_view_in in;
+    cq_view    v;
+    if (now - lastDraw < 30) return;
+    BuildViewIn(&in);
+    cq_view_render(&v, &in);
+    if (gIntent.kind != CQ_INTENT_NONE && !v.ack_active)
+        gIntent.kind = CQ_INTENT_NONE;
+    if (cq_view_differs(&gView, &v)) {
+        lastDraw = now;
+        Redraw();                        /* re-renders into gView, then paints */
     }
 }
 
@@ -1951,6 +2010,7 @@ static void PumpAux(void)
                     if (gSnap.state != CQ_STATE_PLAYING) {
                         DbgLog("auto: play queue head on launch (%ld queued)",
                                (long)gQueueItems.count);
+                        SetIntent(CQ_INTENT_PLAY);
                         PlayFrom(&gQueueItems, 0, NULL);
                     }
                 }
@@ -1983,6 +2043,57 @@ static void PumpAux(void)
             gQueueKick = 0;
             gQueueTx = cq_tx_new(gHost, gPort, "/spot/api/1/queue");
             if (gQueueTx) cq_tx_start(gQueueTx);
+        }
+    }
+
+    /* The media plane's fact (fio B): /spot/api/1/stream at the lazy 10 s
+     * cadence (CLIENTS.md rule 23 — it reconciles, it doesn't render).
+     * Feature-detected once per launch (rule 24): not_found = old server,
+     * stop asking; cq_view then keeps the rx-dry heuristic for the run. */
+    if (gFactTx) {
+        cq_tx_status st = cq_tx_poll(gFactTx);
+        if (st == CQ_TX_DONE) {
+            size_t len = 0;
+            const unsigned char *d = cq_tx_data(gFactTx, &len);
+            cq_fields f;
+            const char *err;
+            cq_fields_init(&f);
+            cq_fields_parse(&f, d, len);
+            err = cq_fields_get(&f, "error");
+            if (err && strcmp(err, "not_found") == 0) {
+                gStreamProbe = -1;
+                DbgLog("stream: not_found - old server, rx heuristic this run");
+            } else if (err) {
+                /* upstream (Icecast unreachable) etc: keep the last fact —
+                 * cq_view ages it out against the advancing /now ts */
+                cq_backoff_fail(&gFBackoff);
+            } else {
+                int live = (int)cq_parse_ll(cq_fields_get(&f, "live"));
+                gStreamProbe = 1;
+                if (!gHaveFact || live != gFactLive)
+                    DbgLog("stream: live %d, %ld listeners", live,
+                           (long)cq_parse_ll(cq_fields_get(&f, "listeners")));
+                gFactLive = live;
+                gFactTs   = cq_parse_ll(cq_fields_get(&f, "ts"));
+                gHaveFact = 1;
+                cq_backoff_ok(&gFBackoff);
+            }
+            cq_fields_free(&f);
+            cq_tx_free(gFactTx); gFactTx = NULL;
+            gFactLast = (unsigned long)TickCount();
+        } else if (st == CQ_TX_FAILED) {
+            cq_tx_free(gFactTx); gFactTx = NULL;
+            gFactLast = (unsigned long)TickCount();
+            cq_backoff_fail(&gFBackoff);
+        }
+    } else if (!gSuspended && gStreamProbe >= 0 &&
+               TxInFlight() < CQ_MAX_INFLIGHT) {
+        unsigned long now = (unsigned long)TickCount();
+        if (now - gFactLast >= (unsigned long)cq_backoff_interval(&gFBackoff) ||
+            gFactLast == 0) {
+            gFactLast = now;
+            gFactTx = cq_tx_new(gHost, gPort, "/spot/api/1/stream");
+            if (gFactTx) cq_tx_start(gFactTx);
         }
     }
 }
@@ -2092,7 +2203,11 @@ static void DoPrefs(void)
         cq_guard_reset(&gGuard);                       /* reconnect: fresh mark, poll now */
         cq_backoff_init(&gBackoff, CQ_POLL_TICKS, CQ_POLL_CAP);
         cq_backoff_init(&gQBackoff, CQ_QUEUE_POLL_TICKS, CQ_POLL_CAP);
+        cq_backoff_init(&gFBackoff, CQ_STREAM_POLL_TICKS, CQ_POLL_CAP);
         gLastPoll = 0;
+        gStreamProbe = 0;                              /* new host: re-probe /stream */
+        gHaveFact = 0;
+        gFactLast = 0;
         while (cq_cache_count(&gCovers) > 0) {          /* refetch covers from the new host */
             GWorldPtr gw = (GWorldPtr)cq_cache_take_oldest(&gCovers);
             if (gw) DisposeGWorld(gw);
@@ -2121,11 +2236,15 @@ static void DoScriptCmd(const char *cmd)
 {
     if      (strcmp(cmd, "listen") == 0) { if (gAuSt == AU_IDLE) ToggleListen(); }
     else if (strcmp(cmd, "stop")   == 0) { if (gAuSt != AU_IDLE) ToggleListen(); }
-    else if (strcmp(cmd, "play")   == 0) StartCommand("/spot/api/1/play");
-    else if (strcmp(cmd, "pause")  == 0) StartCommand("/spot/api/1/pause");
+    else if (strcmp(cmd, "play")   == 0) { SetIntent(CQ_INTENT_PLAY);
+                                           StartCommand("/spot/api/1/play"); }
+    else if (strcmp(cmd, "pause")  == 0) { SetIntent(CQ_INTENT_PAUSE);
+                                           StartCommand("/spot/api/1/pause"); }
     else if (strcmp(cmd, "next")   == 0) NextCommand();
-    else if (strcmp(cmd, "prev")   == 0) StartCommand("/spot/api/1/prev");
-    else if (strcmp(cmd, "wake")   == 0) StartCommand("/spot/api/1/wake?play=1");
+    else if (strcmp(cmd, "prev")   == 0) { SetIntent(CQ_INTENT_SKIP);
+                                           StartCommand("/spot/api/1/prev"); }
+    else if (strcmp(cmd, "wake")   == 0) { SetIntent(CQ_INTENT_PLAY);
+                                           StartCommand("/spot/api/1/wake?play=1"); }
     else if (strncmp(cmd, "search:", 7) == 0) {
         if (gSearchEdit) {
             SetControlData(gSearchEdit, kControlNoPart, kControlEditTextTextTag,
@@ -2278,6 +2397,7 @@ static void HandleEvent(EventRecord *ev)
                 } else if (ch == 't' || ch == 'T') {
                     ToggleListen();
                 } else if (ch == 'k' || ch == 'K') {
+                    SetIntent(CQ_INTENT_PLAY);
                     StartCommand("/spot/api/1/wake?play=1");
                 } else if (ch == 'u' || ch == 'U') {
                     gQueueKick = (unsigned long)TickCount();  /* refresh now */
@@ -2347,14 +2467,6 @@ static void TickCaret(void)
     SetPort(save);
 }
 
-static void TickDiagnostics(void)
-{
-    /* animate the diagnostics ~2x/sec so it's visible the loop is alive */
-    static unsigned long lastDraw = 0;
-    unsigned long now = (unsigned long)TickCount();
-    if (now - lastDraw >= 30) { lastDraw = now; Redraw(); }
-}
-
 int main(void)
 {
     EventRecord ev;
@@ -2410,6 +2522,7 @@ int main(void)
     cq_guard_init(&gGuard);
     cq_backoff_init(&gBackoff, CQ_POLL_TICKS, CQ_POLL_CAP);
     cq_backoff_init(&gQBackoff, CQ_QUEUE_POLL_TICKS, CQ_POLL_CAP);
+    cq_backoff_init(&gFBackoff, CQ_STREAM_POLL_TICKS, CQ_POLL_CAP);
     cq_cache_init(&gCovers);
     cq_debounce_init(&gDeb);
     LoadPrefs();                              /* server address from the prefs file */
@@ -2447,9 +2560,9 @@ int main(void)
         if (WaitNextEvent(everyEvent, &ev, ComputeSleep(), NULL))
             HandleEvent(&ev);
         PollNetwork();       /* /now poll + command/cover/debounce pumps */
-        PumpAux();           /* fire/pls/search/queue pumps + ServiceAudio */
+        PumpAux();           /* fire/pls/search/queue/stream pumps + ServiceAudio */
         TickCaret();         /* blink the search caret (port-pinned) */
-        TickDiagnostics();   /* ~2x/sec status animation */
+        TickView();          /* render → diff → repaint on change (≤2 Hz) */
     }
 
     StopAudio("quit");       /* parks the decode task before cursor resets */

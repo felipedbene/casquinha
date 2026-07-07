@@ -167,7 +167,26 @@ with Retro68 and on the share, pending the UTM runtime pass.
   "Test Casquinha" drives launch→listen→search→add→next→wake→stop→quit with
   paced delays, and "Collect Logs" has the Finder copy every
   `Casquinha b*.log` onto the AFP share.
-- **Player-aware audio status (b49).** "Paused … on air" side by side read
+- **One renderable truth — cq_view (fio B, b56).** The state word (/now),
+  the radio readout (b45/b49), the "Skipping..." ack (b48) and the
+  interpolated progress bar were painted by four code paths driven by four
+  sources with four clocks — and could disagree on screen. All of that
+  vocabulary now renders in the PURE `cq_view` module (host-tested scenario
+  table, 68 checks): the loop gathers ONE input struct (guarded snapshot +
+  /stream fact + engine physics + pending intent + TickCount), renders,
+  diffs against the drawn truth (`cq_view_differs`, ≤2 Hz) and repaints
+  only on display-significant change. New with the server's fio A:
+  `/spot/api/1/stream` is polled at a lazy 10 s cadence (own OT
+  transaction, feature-detected once per launch — not_found = old server,
+  stop asking) and "waiting for Spotify…" becomes a SERVER FACT (`live 0`
+  while /now says playing on the active device, CLIENTS.md 23-24); the
+  rx-dry heuristic survives only as the old-server fallback branch. The
+  ack generalizes b48 into a pending-intent settle predicate (the client
+  half of the server's A2): Skipping/Starting/Pausing... wins over the
+  contradictory state word until the snapshot reflects the command or 8 s
+  time out — no more "Paused" flashing mid-skip. Also fixed structurally:
+  equal-`ts` re-adoption no longer moves the interpolation anchor (the
+  fio A1 audit's ~2 s backward progress jump on cache-window polls).
   as stale (the tail really is audible ~3 s — radio latency — but it looks
   wrong). When the player isn't playing, the readout follows the physics:
   "playing out..." while the ring's tail drains, then "standing by" (tuned,

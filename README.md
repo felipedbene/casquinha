@@ -48,8 +48,12 @@ state entirely in the Toolbox:
 - **Audio** (automatic; ⌘T toggles manually) — with a live, player-aware
   status readout in radio vocabulary: `tuning in… → buffering… N% → on air`,
   `playing out… / standing by` when upstream pauses, `waiting for Spotify…`
-  for the genuine anomaly — and an instant `Skipping...` acknowledgment when
-  you hit Next/Prev. The stream is the live Icecast MP3, decoded **in-app by
+  for the genuine anomaly (a **server fact** from `/spot/api/1/stream` when
+  the server has it; a receive-side heuristic on older servers) — and an
+  instant `Skipping...` acknowledgment when you hit Next/Prev. Everything
+  the player area says is decided by ONE pure, host-tested module
+  (`cq_view`), so the state word, status line and ack can't contradict each
+  other on screen. The stream is the live Icecast MP3, decoded **in-app by
   minimp3** and played through the Sound Manager (`SndPlayDoubleBuffer` fed
   from a PCM ring, ~3 s radio latency with graceful starvation). QuickTime
   proved unable to open a length-less live stream on OS 9, so the whole path

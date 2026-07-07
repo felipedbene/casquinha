@@ -13,6 +13,7 @@ add_application(Casquinha
     ../src/cq_now.c
     ../src/cq_track.c
     ../src/cq_guard.c
+    ../src/cq_view.c              # the one renderable truth (fio B)
     ../src/cq_debounce.c
     ../src/cq_backoff.c
     ../src/cq_cache.c
