@@ -75,7 +75,7 @@ enum {
     kQuitItem    = 3     /* Preferences, -, Quit */
 };
 
-#define CQ_BUILD_TAG "b51"  /* bump on every VM-iteration build (see status row,
+#define CQ_BUILD_TAG "b52"  /* bump on every VM-iteration build (see status row,
                              * the share filenames, and the per-build log name) */
 #define CQ_DEFAULT_HOST "10.0.100.112"  /* server address is a pref (Fio 6) */
 #define CQ_DEFAULT_PORT 70
@@ -1344,6 +1344,131 @@ static pascal void AudioDoubleBack(SndChannelPtr chan, SndDoubleBufferPtr db)
     db->dbFlags |= dbBufferReady;
 }
 
+/* --- the decode task (b52, exp/mp-decode phase 2) ------------------------
+ * The b50 probe proved QEMU/UTM OS 9 schedules MPLibrary tasks even while
+ * the cooperative loop is frozen inside MenuSelect (beats +2552 across a
+ * 15 s menu hold, VM logs 2026-07-06). So the pump moves off-loop: this
+ * preemptive task runs cq_decring_pump — pure C, no Toolbox, no Memory
+ * Manager, no OT — and the PCM ring keeps filling while menus, drags and
+ * dialogs starve WaitNextEvent. Everything else stays on main: the wire
+ * (OT is not MP-safe), the channel start (SndPlayDoubleBuffer is Toolbox),
+ * the trim, all logging.
+ *
+ * Command protocol (single-writer, like every cursor here): main writes
+ * gDecCmd; the task acks into gDecAck after completing a pass in that mode.
+ * Cursor/decoder resets happen ONLY while the task acks PARK. gDecBeat is
+ * the liveness counter the heartbeat narrates. */
+enum { CQ_DEC_PARK = 0, CQ_DEC_RUN = 1, CQ_DEC_QUIT = 2 };
+
+static int                    gMPOk      = 0;     /* MPLibraryIsLoaded() at boot */
+static int                    gMPDecode  = 0;     /* pump on the task? chosen once
+                                                     per listen; 0 = inline (b51) */
+static MPTaskID               gDecTask   = NULL;
+static MPQueueID              gDecQ      = NULL;  /* termination notifications */
+static volatile long          gDecCmd    = CQ_DEC_PARK;   /* main writes */
+static volatile long          gDecAck    = CQ_DEC_PARK;   /* task writes */
+static volatile unsigned long gDecBeat   = 0;             /* task writes */
+static unsigned long long     gAbsPerMs  = 1;    /* UpTime units per ms; main
+                                                    converts gDec.dec_time */
+static unsigned long long     gAbsPer5Ms = 0;    /* the task's nap, precomputed
+                                                    on main so the task needs no
+                                                    conversion calls */
+
+static unsigned long long AbsToU64(AbsoluteTime t)
+{
+    return ((unsigned long long)t.hi << 32) | t.lo;
+}
+
+/* The pump's clock on the task: UpTime is MP-safe (TickCount is a trap —
+ * illegal off the main context). */
+static unsigned long long DecNowUp(void)
+{
+    return AbsToU64(UpTime());
+}
+
+static OSStatus DecodeTaskProc(void *param)
+{
+    cq_decring *r = (cq_decring *)param;
+    for (;;) {
+        long cmd = gDecCmd;
+        if (cmd == CQ_DEC_QUIT) break;
+        if (cmd == CQ_DEC_RUN) cq_decring_pump(r);
+        gDecAck = cmd;            /* ack AFTER a full pass in that mode */
+        gDecBeat++;
+        {   /* ~5 ms nap: one 32 KB chunk lasts ~190 ms, so this is ~38x
+             * service margin while staying polite to the blue task */
+            unsigned long long w = DecNowUp() + gAbsPer5Ms;
+            AbsoluteTime wake;
+            wake.hi = (UInt32)(w >> 32);
+            wake.lo = (UInt32)w;
+            MPDelayUntil(&wake);
+        }
+    }
+    gDecAck = CQ_DEC_QUIT;
+    return noErr;                 /* task exit posts to gDecQ */
+}
+
+/* Create the task once, lazily, at the first listen; it stays up, PARKed
+ * between listens (create/terminate per listen would just add races).
+ * Any failure = inline fallback, i.e. exactly the b51 behavior. */
+static void StartDecTask(void)
+{
+    OSStatus err;
+    if (gDecTask || !gMPOk) return;
+    err = MPCreateQueue(&gDecQ);
+    if (err == noErr) {
+        gDecCmd = gDecAck = CQ_DEC_PARK;
+        err = MPCreateTask(DecodeTaskProc, &gDec, 128 * 1024, gDecQ,
+                           NULL, NULL, 0, &gDecTask);
+    }
+    if (err != noErr) {
+        DbgLog("audio: MPCreateTask failed (err=%ld) - inline decode", (long)err);
+        if (gDecQ) { MPDeleteQueue(gDecQ); gDecQ = NULL; }
+        gDecTask = NULL;
+        return;
+    }
+    DbgLog("audio: decode task up (%ld cpu)", (long)MPProcessors());
+}
+
+/* Park the task and WAIT for the ack: after this returns, the task is
+ * provably between passes and cursor/decoder resets can't race it. The
+ * bound (~500 ms; a pass + nap is ~10 ms) only trips if the task died —
+ * fall back inline and carry on. */
+static void ParkDecTask(void)
+{
+    unsigned long t0;
+    if (!gDecTask) return;
+    gDecCmd = CQ_DEC_PARK;
+    t0 = (unsigned long)TickCount();
+    while (gDecAck != CQ_DEC_PARK) {
+        if ((unsigned long)TickCount() - t0 > 30) {
+            DbgLog("audio: park timeout - decode task dead? going inline");
+            gMPDecode = 0;
+            return;
+        }
+        MPYield();       /* preemptive anyway, but hand the slice over */
+    }
+}
+
+/* App quit: park, ask the task to exit, join via the notify queue. */
+static void QuitDecTask(void)
+{
+    void *p1, *p2, *p3;
+    if (!gDecTask) return;
+    ParkDecTask();
+    gDecCmd = CQ_DEC_QUIT;
+    if (MPWaitOnQueue(gDecQ, &p1, &p2, &p3,
+                      1000 * kDurationMillisecond) != noErr) {
+        DbgLog("audio: decode task join timeout, terminating");
+        MPTerminateTask(gDecTask, noErr);
+        MPWaitOnQueue(gDecQ, &p1, &p2, &p3, 1000 * kDurationMillisecond);
+    }
+    MPDeleteQueue(gDecQ);
+    gDecQ = NULL;
+    gDecTask = NULL;
+    DbgLog("audio: decode task down, %lu beats", gDecBeat);
+}
+
 static void StopAudio(const char *why)
 {
     if (gChan) { SndDisposeChannel(gChan, true); gChan = NULL; }   /* true = quiet NOW */
@@ -1351,9 +1476,10 @@ static void StopAudio(const char *why)
     if (gAuSt != AU_IDLE) DbgLog("audio: stopped (%s)", why);
     gAuSt = AU_IDLE;
     gCompLen = 0;
-    cq_decring_reset(&gDec);   /* b51: the pump runs on this loop, so resetting
-                                * here can't race it. b52 MUST park the MP task
-                                * (gDecCmd/gDecAck handshake) before this line. */
+    ParkDecTask();             /* the pump may live on the MP task: cursor and
+                                * decoder resets are legal only once it acks
+                                * PARK (no task / task dead = plain inline) */
+    cq_decring_reset(&gDec);
     gPlaying = 0;
     gRingWr = gRingRd = 0;
     gRingSkip = 0;
@@ -1381,11 +1507,15 @@ static int OpenAudioOutput(void)
     if (!gRing) { DbgLog("audio: NewPtr(ring %ld) failed", CQ_AUD_RING_BYTES); return 0; }
     if (!gCompRing) gCompRing = NewPtr(CQ_AUD_COMP_RING);
     if (!gCompRing) { DbgLog("audio: NewPtr(comp %ld) failed", CQ_AUD_COMP_RING); return 0; }
+    StartDecTask();            /* lazy, once; failure leaves gDecTask NULL */
+    ParkDecTask();             /* provably parked before the resets below
+                                * (a fresh listen normally already is) */
+    gMPDecode = (gDecTask != NULL);
     gRingWr = gRingRd = 0;
     cq_decring_init(&gDec, (unsigned char *)gCompRing, CQ_AUD_COMP_RING,
                     (unsigned char *)gRing, CQ_AUD_RING_BYTES,
                     &gRingWr, &gRingRd);
-    gDec.now = DecNowTicks;
+    gDec.now = gMPDecode ? DecNowUp : DecNowTicks;
     gDecResSeen = gDecFluSeen = 0;
     cq_mp3dec_init();
     gPlaying = 0;
@@ -1547,16 +1677,22 @@ static void ServiceAudio(void)
                 }
                 gCompLen = 0;
             }
+            if (gMPDecode) {
+                gDecCmd = CQ_DEC_RUN;   /* wake the task; from here the pump
+                                           runs preemptively off-loop */
+                DbgLog("audio: decode task RUNNING");
+            }
         } else if (gCompLen > 32 * 1024) {
             StopAudio("no MP3 frame in 32 KB");
             return;
         }
     }
 
-    /* 4) playback: pump the decode pipeline; drained-out = done. b51 pumps
-     * inline (same behavior as ever); b52 moves this call to the MP task. */
+    /* 4) playback: pump the decode pipeline; drained-out = done. With the MP
+     * task RUNNING the pump happens off-loop and main only reads counters;
+     * inline fallback (no MPLibrary / task died) pumps right here (b51). */
     if (gAuSt == AU_PLAY) {
-        cq_decring_pump(&gDec);
+        if (!gMPDecode) cq_decring_pump(&gDec);
         {   /* narrate the pump's mailbox (the module may not DbgLog — it has
              * to stay legal on an MP task) */
             if (gDec.resyncs != gDecResSeen) {
@@ -1627,13 +1763,26 @@ static void ServiceAudio(void)
                        (long)(CQ_AUD_PREBUF_PCM / 1024), gRxTotal);
             else {
                 long uok = 0, ufail = 0, uerr = 0;
+                /* dec_time unit differs per context (ticks inline, UpTime on
+                 * the task) — normalize to ms so builds stay comparable */
+                long decms = gMPDecode
+                           ? (long)(gDec.dec_time / gAbsPerMs)
+                           : (long)(gDec.dec_time * 50 / 3);
                 cq_tx_udp_stats(&uok, &ufail, &uerr);
-                DbgLog("audio: playing, ring %ld KB, fires %ld, sil %ld, trims %ld, dec %ldf/%ldt, pcm %ldK, %ld staged, %ld rx, udp %ld/%ld e%ld",
+                DbgLog("audio: playing, ring %ld KB, fires %ld, sil %ld, trims %ld, dec %ldf/%ldms, pcm %ldK, %ld staged, %ld rx, mp %lu, udp %ld/%ld e%ld",
                        (long)((gRingWr - gRingRd) / 1024),
                        gDBFires, gDBSilence, gTrims, gDec.frames,
-                       (long)gDec.dec_time, gDec.pcm_total / 1024,
+                       decms, gDec.pcm_total / 1024,
                        (long)(gDec.comp_wr - gDec.comp_rd + gDec.stage_len),
-                       gRxTotal, uok, ufail, uerr);
+                       gRxTotal, (unsigned long)gDecBeat, uok, ufail, uerr);
+                {   /* the task-alive tell: RUNNING but no beats since the
+                     * last heartbeat = the decoder is gone; say so loudly */
+                    static unsigned long prevBeat = 0;
+                    if (gMPDecode && gDecCmd == CQ_DEC_RUN &&
+                        gDecBeat == prevBeat)
+                        DbgLog("audio: MP TASK STALLED (beat %lu)", gDecBeat);
+                    prevBeat = gDecBeat;
+                }
             }
         }
     } else if ((unsigned long)TickCount() - gAuBeat >= 300) {   /* pre-play: ~5 s */
@@ -2083,81 +2232,6 @@ static void DoMouseDown(EventRecord *ev)
     }
 }
 
-/* --- MP smoke probe (b50, exp/mp-decode phase 0) ------------------------
- * Before any audio surgery: prove Multiprocessing Services schedules a
- * preemptive task under UTM/QEMU OS 9 — INCLUDING while the cooperative
- * loop is frozen inside MenuSelect. The task only bumps a counter (~200/s);
- * the heartbeat log brackets a menu hold, so the first post-release delta
- * shows whether it kept counting while WaitNextEvent starved. If it did,
- * the decoder can live there and the ring survives menus; if not, the
- * experiment dies here for the price of one build.
- * MP tasks get NO Toolbox, NO Memory Manager, NO Open Transport. */
-static int                    gMPOk        = 0;    /* MPLibraryIsLoaded() at boot */
-static MPTaskID               gMPProbeTask = NULL;
-static MPQueueID              gMPProbeQ    = NULL; /* termination notifications */
-static volatile unsigned long gMPBeat      = 0;    /* task writes, main reads */
-static volatile long          gMPProbeQuit = 0;    /* main writes, task reads */
-
-static OSStatus MPProbeProc(void *param)
-{
-    AbsoluteTime wake;
-    (void)param;
-    while (!gMPProbeQuit) {
-        gMPBeat++;
-        wake = AddDurationToAbsolute(5 * kDurationMillisecond, UpTime());
-        MPDelayUntil(&wake);
-    }
-    return noErr;                 /* task exit posts to gMPProbeQ */
-}
-
-static void StartMPProbe(void)
-{
-    OSStatus err;
-    if (!gMPOk) return;
-    err = MPCreateQueue(&gMPProbeQ);
-    if (err == noErr)
-        err = MPCreateTask(MPProbeProc, NULL, 32 * 1024, gMPProbeQ,
-                           NULL, NULL, 0, &gMPProbeTask);
-    if (err != noErr) {
-        DbgLog("mp: probe task failed (err=%ld)", (long)err);
-        if (gMPProbeQ) { MPDeleteQueue(gMPProbeQ); gMPProbeQ = NULL; }
-        gMPProbeTask = NULL;
-        return;
-    }
-    DbgLog("mp: probe task up (%ld cpu)", (long)MPProcessors());
-}
-
-static void StopMPProbe(void)
-{
-    void *p1, *p2, *p3;
-    if (!gMPProbeTask) return;
-    gMPProbeQuit = 1;             /* task exits its loop within ~5 ms */
-    if (MPWaitOnQueue(gMPProbeQ, &p1, &p2, &p3,
-                      1000 * kDurationMillisecond) != noErr) {
-        DbgLog("mp: probe join timeout, terminating");
-        MPTerminateTask(gMPProbeTask, noErr);
-        MPWaitOnQueue(gMPProbeQ, &p1, &p2, &p3, 1000 * kDurationMillisecond);
-    }
-    MPDeleteQueue(gMPProbeQ);
-    gMPProbeQ = NULL;
-    gMPProbeTask = NULL;
-    DbgLog("mp: probe down, %lu beats", gMPBeat);
-}
-
-static void TickMPProbe(void)
-{
-    static unsigned long lastLog = 0, lastBeat = 0;
-    unsigned long now;
-    if (!gMPProbeTask) return;
-    now = (unsigned long)TickCount();
-    if (now - lastLog >= 300) {   /* ~5 s cadence; the delta spanning a menu
-                                   * hold is the whole experiment */
-        DbgLog("mp: beat %lu (+%lu)", gMPBeat, gMPBeat - lastBeat);
-        lastBeat = gMPBeat;
-        lastLog  = now;
-    }
-}
-
 /* --- the cooperative loop, decomposed (b50) ------------------------------
  * main()'s while stays the only clock; these are its limbs, extracted
  * verbatim so the loop body reads as the schedule it actually is. */
@@ -2290,13 +2364,19 @@ int main(void)
 
     gQTOk = (EnterMovies() == noErr);         /* QuickTime for cover-art decode */
     gMPOk = MPLibraryIsLoaded();              /* preemptive tasks available? (b50) */
+    if (gMPOk) {
+        /* UpTime<->wall units, computed once on main: the decode task must
+         * not call conversion services, it just adds raw u64s (b52) */
+        gAbsPerMs  = AbsToU64(DurationToAbsolute(kDurationMillisecond));
+        gAbsPer5Ms = AbsToU64(DurationToAbsolute(5 * kDurationMillisecond));
+        if (!gAbsPerMs) gAbsPerMs = 1;
+    }
     {   /* boot line: which build, and exactly which QuickTime/MP is under us */
         long qtv = 0;
         Gestalt(gestaltQuickTimeVersion, &qtv);
         DbgLog("boot %s  QT=%s ver=%08lx  MP=%s", CQ_BUILD_TAG,
                gQTOk ? "ok" : "MISSING", qtv, gMPOk ? "yes" : "no");
     }
-    StartMPProbe();                           /* b50 smoke probe (no-op if MP=no) */
 
     {   /* converters: UTF-8 -> MacRoman (draw) and MacRoman -> UTF-8 (wire) */
         TextEncoding utf8 = CreateTextEncoding(kTextEncodingUnicodeV2_0,
@@ -2356,11 +2436,10 @@ int main(void)
         PumpAux();           /* fire/pls/search/queue pumps + ServiceAudio */
         TickCaret();         /* blink the search caret (port-pinned) */
         TickDiagnostics();   /* ~2x/sec status animation */
-        TickMPProbe();       /* b50: preemptive-task liveness heartbeat */
     }
 
-    StopMPProbe();
-    StopAudio("quit");
+    StopAudio("quit");       /* parks the decode task before cursor resets */
+    QuitDecTask();
     if (gLogRef) { DbgLog("quit"); FSClose(gLogRef); gLogRef = 0; }
     if (gTx) { cq_tx_cancel(gTx); cq_tx_free(gTx); }
     cq_now_free(&gSnap);
