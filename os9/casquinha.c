@@ -77,7 +77,7 @@ enum {
     kQuitItem    = 3     /* Preferences, -, Quit */
 };
 
-#define CQ_BUILD_TAG "b58"  /* bump on every VM-iteration build (see status row,
+#define CQ_BUILD_TAG "b59"  /* bump on every VM-iteration build (see status row,
                              * the share filenames, and the per-build log name) */
 #define CQ_DEFAULT_HOST "10.0.100.112"  /* server address is a pref (Fio 6) */
 #define CQ_DEFAULT_PORT 70
@@ -813,6 +813,31 @@ static int PumpTx(cq_transport **txp, int isPoll)
 
 /* Fire a command over its own transaction (separate from the poll). Drops if a
  * command is already in flight — the poll reconciles. */
+/* --- UI action debounce (b59) ---------------------------------------------
+ * A command's round-trip + server settle is ~0.5-2 s. With no instant feedback a
+ * user re-clicks, and every extra click used to fire — drill x3, play/context x2,
+ * a DOUBLE queue/album append (a real side effect). Swallow a repeat of the SAME
+ * action within the guard window; DISTINCT actions are never blocked, so paced
+ * deliberate actions stay snappy. Transport keeps its own coalescer (gDeb) and
+ * volume its hold window, so this governs only the discrete list/button actions
+ * (drill, play/context, play/from, queue/add, queue/album, search, play/pause). */
+#define CQ_ACTION_GUARD_TICKS 40           /* ~0.67 s at 60 ticks/s */
+static char          gLastAction[240] = "";
+static unsigned long gLastActionTick  = 0;
+static int ActionRepeat(const char *sel)
+{
+    unsigned long now = (unsigned long)TickCount();
+    if (gLastAction[0] && strcmp(sel, gLastAction) == 0 &&
+        (long)(now - gLastActionTick) < CQ_ACTION_GUARD_TICKS) {
+        DbgLog("debounce: swallowed repeat %s", sel);
+        return 1;
+    }
+    strncpy(gLastAction, sel, sizeof(gLastAction) - 1);
+    gLastAction[sizeof(gLastAction) - 1] = '\0';
+    gLastActionTick = now;
+    return 0;
+}
+
 static void StartCommand(const char *sel)
 {
     if (gCmd) return;
@@ -1008,11 +1033,14 @@ static void DoContentClick(WindowRef win, Point where)
                 gCmdFire = (unsigned long)TickCount() + CQ_DEBOUNCE_TICKS;
             } else if (ctl == gNext) {
                 NextCommand();               /* obeys the visible queue (b37) */
-            } else if (ctl == gPlay) {       /* immediate toggle */
-                SetIntent(gSnap.state == CQ_STATE_PLAYING ?
-                          CQ_INTENT_PAUSE : CQ_INTENT_PLAY);
-                StartCommand(gSnap.state == CQ_STATE_PLAYING ?
-                             "/spot/api/1/pause" : "/spot/api/1/play");
+            } else if (ctl == gPlay) {       /* immediate toggle (debounced, b59) */
+                const char *ps = gSnap.state == CQ_STATE_PLAYING ?
+                                 "/spot/api/1/pause" : "/spot/api/1/play";
+                if (!ActionRepeat(ps)) {
+                    SetIntent(gSnap.state == CQ_STATE_PLAYING ?
+                              CQ_INTENT_PAUSE : CQ_INTENT_PLAY);
+                    StartCommand(ps);
+                }
             } else if (ctl == gVol) {        /* commit on mouse-up, then hold (law 4) */
                 char sel[48];
                 snprintf(sel, sizeof(sel), "/spot/api/1/volume?%d", GetControlValue(gVol));
@@ -1233,8 +1261,9 @@ static void StartArtistAlbums(const char *artistId, const char *artistName)
 {
     char sel[128];
     if (!artistId || !artistId[0]) return;
-    if (gArtistTx) { cq_tx_cancel(gArtistTx); cq_tx_free(gArtistTx); gArtistTx = NULL; }
     snprintf(sel, sizeof(sel), "/spot/api/1/artist/%s/albums", artistId);
+    if (ActionRepeat(sel)) return;   /* debounce repeat drill (b59) */
+    if (gArtistTx) { cq_tx_cancel(gArtistTx); cq_tx_free(gArtistTx); gArtistTx = NULL; }
     strncpy(gBrowseArtist, artistName ? artistName : "", sizeof(gBrowseArtist) - 1);
     gBrowseArtist[sizeof(gBrowseArtist) - 1] = '\0';
     gArtistTx = cq_tx_new(gHost, gPort, sel);
@@ -1253,6 +1282,7 @@ static void PlayContextAlbum(const char *albumId)
     snprintf(uri, sizeof(uri), "spotify:album:%s", albumId);
     EscInto(uri, euri, sizeof(euri), 1);   /* keep the colons */
     snprintf(sel, sizeof(sel), "/spot/api/1/play/context?uri=%s", euri);
+    if (ActionRepeat(sel)) return;   /* debounce repeat album play (b59) */
     SetIntent(CQ_INTENT_PLAY);
     StartCommand(sel);
     DbgLog("play/context: album %s", albumId);
@@ -1278,6 +1308,7 @@ static ListHandle MakeList(WindowRef win, const Rect *area)
 static cq_transport *gFire = NULL;
 static void StartFire(const char *sel)
 {
+    if (ActionRepeat(sel)) return;   /* debounce double-click / lag re-tap (b59) */
     if (gFire) return;
     gFire = cq_tx_new(gHost, gPort, sel);
     if (gFire) cq_tx_start(gFire);
@@ -1334,6 +1365,7 @@ static void PlayFrom(cq_track_list *items, int row, cq_track_list *cont)
     gFallbackUri[sizeof(gFallbackUri) - 1] = '\0';
     DbgLog("play/from: %d ids (row %d)%s", n, row,
            gNativePlay == 0 ? " [probe]" : "");
+    if (ActionRepeat(sel)) return;   /* debounce repeat list play (b59) */
     StartCommand(sel);
 }
 
@@ -1350,6 +1382,7 @@ static void RunSearch(void)
     ToUTF8(q, q8, sizeof(q8));       /* MacRoman field -> UTF-8 wire (Fio F) */
     EscInto(q8, eq, sizeof(eq), 0);
     snprintf(sel, sizeof(sel), "/spot/api/1/search?q=%s", eq);
+    if (ActionRepeat(sel)) return;   /* debounce a repeat of the same query (b59) */
     /* A fresh search leaves any artist-drill (b57): clear browse mode and the
      * drilled discography so the reply repaints normal artist/album/track rows. */
     gAlbumBrowse = 0;
