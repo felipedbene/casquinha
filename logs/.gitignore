@@ -1,0 +1,3 @@
+# Keep the compressed archives and curated extracts; not raw uncompressed dumps.
+*.log
+!*.log.gz
