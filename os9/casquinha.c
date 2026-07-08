@@ -77,7 +77,7 @@ enum {
     kQuitItem    = 3     /* Preferences, -, Quit */
 };
 
-#define CQ_BUILD_TAG "b62"  /* bump on every VM-iteration build (see status row,
+#define CQ_BUILD_TAG "b63"  /* bump on every VM-iteration build (see status row,
                              * the share filenames, and the per-build log name) */
 #define CQ_DEFAULT_HOST "10.0.100.112"  /* server address is a pref (Fio 6) */
 #define CQ_DEFAULT_PORT 70
@@ -2418,138 +2418,163 @@ static void PrefsSpec(FSSpec *spec)
         FSMakeFSSpec(vRef, dirID, "\pCasquinha Prefs", spec);
 }
 
+/* Read the backend config. Hand-editable (b63): tolerant of '#' comments, blank
+ * lines, and either "host:port" on one line or host/port on separate lines
+ * (legacy). Any line ending (\r from SimpleText, \n) works. */
 static void LoadPrefs(void)
 {
     FSSpec spec;
     short  ref;
-    long   count = 200;
+    long   count = 255;
     char   buf[256];
-    char  *nl;
+    char  *line;
 
     PrefsSpec(&spec);
     if (FSpOpenDF(&spec, fsRdPerm, &ref) != noErr) return;
     FSRead(ref, &count, buf);                 /* count comes back = bytes read */
     FSClose(ref);
     if (count <= 0) return;
+    if (count > 255) count = 255;
     buf[count] = '\0';
-    nl = strchr(buf, '\n');
-    if (nl) {
-        int p;
-        *nl = '\0';
-        if (buf[0]) { strncpy(gHost, buf, sizeof(gHost) - 1); gHost[sizeof(gHost) - 1] = '\0'; }
-        p = atoi(nl + 1);
-        if (p > 0 && p < 65536) gPort = p;
+
+    for (line = strtok(buf, "\r\n"); line; line = strtok(NULL, "\r\n")) {
+        char *p = line;
+        char *colon;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\0' || *p == '#') continue;         /* blank / comment */
+        colon = strrchr(p, ':');
+        if (colon) {                                   /* "host:port" */
+            int pt;
+            *colon = '\0';
+            if (p[0]) { strncpy(gHost, p, sizeof(gHost) - 1); gHost[sizeof(gHost) - 1] = '\0'; }
+            pt = atoi(colon + 1);
+            if (pt > 0 && pt < 65536) gPort = pt;
+            break;
+        } else if (p[0] >= '0' && p[0] <= '9') {       /* bare port (legacy 2-line) */
+            int pt = atoi(p);
+            if (pt > 0 && pt < 65536) gPort = pt;
+            break;
+        } else {                                       /* bare host (legacy 2-line) */
+            strncpy(gHost, p, sizeof(gHost) - 1); gHost[sizeof(gHost) - 1] = '\0';
+        }                                              /* keep scanning for a port */
     }
 }
 
+/* Write the config as a SimpleText document (creator 'ttxt' so File▸Preferences
+ * opens it in SimpleText, not back in Casquinha) with a human header and classic
+ * \r line endings. Forces the type/creator even on a pre-existing file. */
 static void SavePrefs(void)
 {
     FSSpec spec;
     short  ref;
     long   count;
-    char   buf[128];
+    char   buf[192];
+    FInfo  fi;
 
     PrefsSpec(&spec);
-    FSpCreate(&spec, 'Casq', 'TEXT', smSystemScript);   /* harmless if it exists */
+    FSpCreate(&spec, 'ttxt', 'TEXT', smSystemScript);   /* SimpleText doc; no-op if it exists */
+    if (FSpGetFInfo(&spec, &fi) == noErr) {             /* re-stamp an existing file */
+        fi.fdType = 'TEXT'; fi.fdCreator = 'ttxt';
+        FSpSetFInfo(&spec, &fi);
+    }
     if (FSpOpenDF(&spec, fsWrPerm, &ref) != noErr) return;
-    snprintf(buf, sizeof(buf), "%s\n%d\n", gHost, gPort);
-    count = (long)strlen(buf);
+    count = (long)snprintf(buf, sizeof(buf),
+        "# Casquinha backend. Edit host:port, save, switch back to Casquinha.\r"
+        "# gopher control endpoint (dotted-quad or hostname):port\r"
+        "%s:%d\r", gHost, gPort);
     SetEOF(ref, 0);
     FSWrite(ref, &count, buf);
     FSClose(ref);
 }
 
-/* O3 (RESILIENCE-ROADMAP Phase 2): the Prefs ModalDialog runs a nested modal
- * loop that starves WaitNextEvent — the same freeze class the loop documents at
- * :1623 (menus, drags and dialogs). Decode survives off-loop (b52), but the
- * on-main network polls and the audio channel-start/latency-trim stall while
- * Prefs is open. A ModalFilterUPP lets us drive the same per-pass background
- * work on every modal pass, so the loop keeps breathing behind the dialog.
- * Set CQ_PREFS_PUMP=0 to fall back to the proven-b60 ModalDialog(NULL, ...). */
-#ifndef CQ_PREFS_PUMP
-#define CQ_PREFS_PUMP 1
-#endif
+/* --- Backend endpoint: edit-the-config-file, not a modal dialog (b63) --------
+ * b62 shipped a Prefs ModalDialog filter (O3) meant to keep the loop breathing
+ * behind the dialog; VM validation proved it doesn't — ModalDialog gives the
+ * filter no time on an idle hold, so a 30 s Prefs hold froze the loop (the O1
+ * watchdog caught it: loop-probe HandleEvent +29583ms) and starved audio. The
+ * fix removes the hazard instead of defending it: host:port is the ONLY setting,
+ * so File▸Preferences opens the config in SimpleText (Casquinha suspends to the
+ * background — the loop keeps running, audio plays), and the edit is applied on
+ * RESUME. `server:host:port` (do-script) does the same headlessly. */
 
-#if CQ_PREFS_PUMP
-/* The same three limbs the main loop runs (minus WNE/caret), driven per modal
- * pass. Throttled to ~once every few ticks because ModalDialog calls the filter
- * very frequently (null/mouse-moved events). Reentrancy: DoPrefs is reached
- * from the loop (mouseDown → DoMenu → DoPrefs), so this is a reentrant poll
- * slice — safe because PollNetwork/PumpAux are idempotent bounded slices; we
- * deliberately call NOTHING that could open a nested dialog. Returns false so
- * ModalDialog keeps its normal button/keyboard processing. */
-static pascal Boolean PrefsFilter(DialogPtr d, EventRecord *ev, short *item)
+/* Tell the Finder to open a document — it launches the file's creator app, i.e.
+ * SimpleText, since SavePrefs stamps the config 'ttxt'. kAENoReply = fire and
+ * forget, so this never blocks the loop. */
+static void OpenDocInFinder(const FSSpec *spec)
 {
-    static unsigned long lastPump = 0;
-    unsigned long now = (unsigned long)TickCount();
-    (void)d; (void)ev; (void)item;
-    if (now - lastPump >= 4) {          /* ~once per 4 ticks, not every null event */
-        lastPump = now;
-        PollNetwork();                  /* /now poll + command/cover/debounce pumps */
-        PumpAux();                      /* fire/pls/search/queue/stream + ServiceAudio */
-        TickView();                     /* render → diff → repaint on change */
+    OSType       finder = 'MACS';
+    AEAddressDesc target = { typeNull, NULL };
+    AppleEvent   ae = { typeNull, NULL }, reply = { typeNull, NULL };
+    AEDescList   docs = { typeNull, NULL };
+
+    if (AECreateDesc(typeApplSignature, &finder, sizeof(finder), &target) != noErr) return;
+    if (AECreateAppleEvent(kCoreEventClass, kAEOpenDocuments, &target,
+                           kAutoGenerateReturnID, kAnyTransactionID, &ae) == noErr) {
+        if (AECreateList(NULL, 0, false, &docs) == noErr) {
+            AEPutPtr(&docs, 1, typeFSS, spec, sizeof(FSSpec));
+            AEPutParamDesc(&ae, keyDirectObject, &docs);
+            AEDisposeDesc(&docs);
+        }
+        AESend(&ae, &reply, kAENoReply, kAENormalPriority, kAEDefaultTimeout, NULL, NULL);
+        AEDisposeDesc(&reply);
+        AEDisposeDesc(&ae);
     }
-    return false;                       /* not handled — ModalDialog does its own work */
+    AEDisposeDesc(&target);
 }
 
-static ModalFilterUPP gPrefsFilterUPP = NULL;   /* built once, lives for the run */
-#endif
-
-/* Preferences dialog: edit host + port, save, and reconnect. */
-static void DoPrefs(void)
+/* Point every gopher transaction at the current gHost:gPort: drop anything in
+ * flight against the old backend, reset the guard/backoff/probes, and let the
+ * next loop pass poll the new one. Audio (a separate Icecast host) is left
+ * playing; ⌘T re-discovers its stream from the new backend. */
+static void ApplyServerChange(void)
 {
-    DialogPtr d = GetNewDialog(kPrefsDialog, NULL, (WindowPtr)-1);
-    short  item, type;
-    Handle h;
-    Rect   box;
-    Str255 ps;
-    char   pbuf[16];
+    if (gTx)       { cq_tx_cancel(gTx);       cq_tx_free(gTx);       gTx = NULL; }
+    if (gCmd)      { cq_tx_cancel(gCmd);      cq_tx_free(gCmd);      gCmd = NULL; }
+    if (gCover)    { cq_tx_cancel(gCover);    cq_tx_free(gCover);    gCover = NULL; }
+    if (gFire)     { cq_tx_cancel(gFire);     cq_tx_free(gFire);     gFire = NULL; }
+    if (gSearchTx) { cq_tx_cancel(gSearchTx); cq_tx_free(gSearchTx); gSearchTx = NULL; }
+    if (gArtistTx) { cq_tx_cancel(gArtistTx); cq_tx_free(gArtistTx); gArtistTx = NULL; }
+    if (gQueueTx)  { cq_tx_cancel(gQueueTx);  cq_tx_free(gQueueTx);  gQueueTx = NULL; }
+    if (gFactTx)   { cq_tx_cancel(gFactTx);   cq_tx_free(gFactTx);   gFactTx = NULL; }
+    if (gPls)      { cq_tx_cancel(gPls);      cq_tx_free(gPls);      gPls = NULL; }
 
-    if (!d) return;
-    /* The DLOG resource is `invisible` (built hidden so we can populate the edit
-     * fields before it paints). It MUST be shown before ModalDialog — otherwise
-     * the modal loop runs on a hidden dialog whose Save/Cancel buttons can't be
-     * clicked, so it never sees item 1/2 and never returns: the whole machine
-     * appears frozen (cursor moves, nothing responds). */
-    ShowWindow(d);
-
-    GetDialogItem(d, 3, &type, &h, &box);              /* host edit field */
-    C2P(gHost, ps); SetDialogItemText(h, ps);
-    GetDialogItem(d, 5, &type, &h, &box);              /* port edit field */
-    snprintf(pbuf, sizeof(pbuf), "%d", gPort);
-    C2P(pbuf, ps); SetDialogItemText(h, ps);
-    SelectDialogItemText(d, 3, 0, 32767);
-
-#if CQ_PREFS_PUMP
-    if (!gPrefsFilterUPP) gPrefsFilterUPP = NewModalFilterUPP(PrefsFilter);
-    /* Filter services the loop each pass so polls/audio don't freeze (O3). */
-    do { ModalDialog(gPrefsFilterUPP, &item); } while (item != 1 && item != 2);
-#else
-    do { ModalDialog(NULL, &item); } while (item != 1 && item != 2);   /* proven b60 */
-#endif
-
-    if (item == 1) {                                   /* Save */
-        char host[64]; int p;
-        GetDialogItem(d, 3, &type, &h, &box); GetDialogItemText(h, ps); P2C(ps, host, sizeof(host));
-        GetDialogItem(d, 5, &type, &h, &box); GetDialogItemText(h, ps); P2C(ps, pbuf, sizeof(pbuf));
-        p = atoi(pbuf);
-        if (host[0]) { strncpy(gHost, host, sizeof(gHost) - 1); gHost[sizeof(gHost) - 1] = '\0'; }
-        if (p > 0 && p < 65536) gPort = p;
-        SavePrefs();
-        cq_guard_reset(&gGuard);                       /* reconnect: fresh mark, poll now */
-        cq_backoff_init(&gBackoff, CQ_POLL_TICKS, CQ_POLL_CAP);
-        cq_backoff_init(&gQBackoff, CQ_QUEUE_POLL_TICKS, CQ_POLL_CAP);
-        cq_backoff_init(&gFBackoff, CQ_STREAM_POLL_TICKS, CQ_POLL_CAP);
-        gLastPoll = 0;
-        gStreamProbe = 0;                              /* new host: re-probe /stream */
-        gHaveFact = 0;
-        gFactLast = 0;
-        while (cq_cache_count(&gCovers) > 0) {          /* refetch covers from the new host */
-            GWorldPtr gw = (GWorldPtr)cq_cache_take_oldest(&gCovers);
-            if (gw) DisposeGWorld(gw);
-        }
+    cq_guard_reset(&gGuard);
+    cq_backoff_init(&gBackoff,  CQ_POLL_TICKS,        CQ_POLL_CAP);
+    cq_backoff_init(&gQBackoff, CQ_QUEUE_POLL_TICKS,  CQ_POLL_CAP);
+    cq_backoff_init(&gFBackoff, CQ_STREAM_POLL_TICKS, CQ_POLL_CAP);
+    gLastPoll = 0; gQueueLast = 0; gQueueKick = 0;
+    gStreamProbe = 0; gHaveFact = 0; gFactLast = 0;
+    while (cq_cache_count(&gCovers) > 0) {              /* covers are per-host */
+        GWorldPtr gw = (GWorldPtr)cq_cache_take_oldest(&gCovers);
+        if (gw) DisposeGWorld(gw);
     }
-    DisposeDialog(d);
+    DbgLog("server: now %s:%d", gHost, gPort);
+}
+
+/* Re-read the config after an edit; reconnect only if host/port actually moved.
+ * Called on resume (switching back from SimpleText). */
+static void ReloadConfig(void)
+{
+    char oldHost[64];
+    int  oldPort = gPort;
+    strncpy(oldHost, gHost, sizeof(oldHost) - 1); oldHost[sizeof(oldHost) - 1] = '\0';
+    LoadPrefs();
+    if (strcmp(oldHost, gHost) != 0 || oldPort != gPort) {
+        DbgLog("config: %s:%d -> %s:%d (edited)", oldHost, oldPort, gHost, gPort);
+        ApplyServerChange();
+    }
+}
+
+/* File▸Preferences: ensure the config exists (current values + header) and open
+ * it in SimpleText. No modal, no freeze — Casquinha just goes to the background
+ * while you edit; ReloadConfig() applies it when you switch back. */
+static void OpenPrefsInEditor(void)
+{
+    FSSpec spec;
+    SavePrefs();
+    PrefsSpec(&spec);
+    OpenDocInFinder(&spec);
+    DbgLog("config: opened Casquinha Prefs in editor");
 }
 
 static void SetUpMenus(void)
@@ -2567,6 +2592,7 @@ static void SetUpMenus(void)
  * whose direct object is one command string. From Script Editor on the VM:
  *     tell application "Casquinha" to «event miscdosc» "listen"
  * Commands: listen stop play pause next prev wake add search:<query>
+ *           server:<host>[:<port>]  (repoint the gopher backend, live)
  * Every event is logged, so a scripted run narrates itself in the log. */
 static void DoScriptCmd(const char *cmd)
 {
@@ -2598,6 +2624,26 @@ static void DoScriptCmd(const char *cmd)
             LSetSelect(true, c, gSearchList);
         }
         QueueSelected();
+    }
+    else if (strncmp(cmd, "server:", 7) == 0) {   /* repoint the gopher backend (b63) */
+        const char *arg = cmd + 7;
+        const char *colon = strrchr(arg, ':');
+        char host[64];
+        int  port = gPort;
+        if (colon) {
+            size_t hn = (size_t)(colon - arg);
+            if (hn >= sizeof(host)) hn = sizeof(host) - 1;
+            memcpy(host, arg, hn); host[hn] = '\0';
+            { int p = atoi(colon + 1); if (p > 0 && p < 65536) port = p; }
+        } else {
+            strncpy(host, arg, sizeof(host) - 1); host[sizeof(host) - 1] = '\0';
+        }
+        if (host[0]) {
+            strncpy(gHost, host, sizeof(gHost) - 1); gHost[sizeof(gHost) - 1] = '\0';
+            gPort = port;
+            SavePrefs();
+            ApplyServerChange();
+        }
     }
     else DbgLog("apple-event: unknown command \"%s\"", cmd);
 }
@@ -2666,7 +2712,7 @@ static void DoMenu(long choice)
         case kFileMenu:
             /* b30: search/queue/listen/wake are main-window controls now —
              * nothing you'd touch mid-listening is left behind a menu. */
-            if (item == kPrefsItem)      DoPrefs();
+            if (item == kPrefsItem)      OpenPrefsInEditor();   /* edit config in SimpleText (b63) */
             else if (item == kQuitItem)  gRunning = false;
             break;
     }
@@ -2780,7 +2826,7 @@ static void HandleEvent(EventRecord *ev)
              * ⌘T audio plays on. Resume kicks an immediate /now. */
             if (((ev->message >> 24) & 0xFF) == suspendResumeMessage) {
                 gSuspended = (ev->message & resumeFlag) == 0;
-                if (!gSuspended) gLastPoll = 0;
+                if (!gSuspended) { ReloadConfig(); gLastPoll = 0; }  /* apply a config edit (b63) */
             }
             break;
         case kHighLevelEvent:
