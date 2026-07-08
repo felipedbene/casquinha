@@ -53,6 +53,29 @@
 #endif
 #define CQ_TX_PROBE_WARN_TICKS 6   /* ~100 ms; anything slower on a LAN is suspect */
 
+/* --- b61 async connect (design/FREEZE-AUDIT-b59.md §9 opt 3) -----------------
+ * The b60 probe proved OTConnect is the on-loop lag: its SYNCHRONOUS issue
+ * blocks the cooperative loop ~150 ms in calm LAN, up to ~1.2 s under a server
+ * rollout — every transaction pays it (a fresh connect per gopher txn; the
+ * response is the txn terminator, so the connection can't be pooled). Fix: put
+ * the endpoint in ASYNC mode for the connect only, so OTConnect returns at once
+ * and the connection completes off-trap; the poll loop already waits out the
+ * completion in ST_CONNECTING under the 2 s deadline. Open + bind stay
+ * synchronous (both stayed under the probe threshold), and the endpoint reverts
+ * to synchronous the instant T_CONNECT lands, so send/recv keep the proven
+ * sync+non-blocking path. Set CQ_TX_ASYNC_CONNECT=0 to fall back to the b60
+ * all-synchronous connect (the proven-enough path) with one rebuild.
+ *
+ * NOT YET VALIDATED ON THE VM. Load-bearing OT assumptions (the b61 drop + the
+ * probe confirm/refute them in one run): (a) OTConnect in async mode returns
+ * immediately with kOTNoError = "in progress"; (b) completion surfaces as a
+ * T_CONNECT the loop can see via OTLook AND/OR the notifier flag (both are
+ * checked). If wrong, connects simply time out at the 2 s deadline — loud,
+ * non-crashing, reversible — never a worse hang. */
+#ifndef CQ_TX_ASYNC_CONNECT
+#define CQ_TX_ASYNC_CONNECT 1
+#endif
+
 static cq_tx_logfn g_log = NULL;
 
 void cq_tx_set_log(cq_tx_logfn fn) { g_log = fn; }
@@ -93,6 +116,10 @@ static void probe_trace(const char *name)
  * cancel/free — so every teardown site routes through here (§4). */
 static void ot_teardown(EndpointRef ep)
 {
+#if CQ_TX_ASYNC_CONNECT
+    OTRemoveNotifier(ep);   /* stop callbacks before close; harmless if none
+                             * was installed (return ignored) */
+#endif
     OT_PROBE("OTUnbind", OTUnbind(ep));
     OT_PROBE("OTCloseProvider", OTCloseProvider(ep));
 }
@@ -128,7 +155,27 @@ struct cq_transport {
     unsigned long  connect_tick;
     int            cancelled;
     int            streaming;   /* endless response: drain-driven, no watchdog */
+    int            async;       /* b61: endpoint is in async mode for the connect */
+    volatile long  conn_event;  /* b61: last connect-phase OTEventCode the notifier
+                                 * saw (T_CONNECT / T_DISCONNECT); one long, written
+                                 * from notifier context, read on the loop */
 };
+
+#if CQ_TX_ASYNC_CONNECT
+/* Async connect notifier. Runs at OT notification (deferred/interrupt) time, so
+ * it does NO work: it records ONLY the connect-phase event into the transport
+ * (one aligned long write, the sole thing shared with the loop) and returns.
+ * The loop polls conn_event (and OTLook) in ST_CONNECTING. Other events (T_DATA,
+ * T_GODATA, ...) are ignored — we revert to synchronous before send/recv, and
+ * OTCloseProvider tears the notifier down with the endpoint. */
+static pascal void conn_notifier(void *ctx, OTEventCode code, OTResult res, void *cookie)
+{
+    (void)res; (void)cookie;
+    if (ctx && (code == T_CONNECT || code == T_DISCONNECT))
+        ((cq_transport *)ctx)->conn_event = (long)code;
+}
+static OTNotifyUPP g_conn_upp = NULL;
+#endif
 
 /* One-time OT startup (single-threaded cooperative app, so a static flag is safe). */
 static int g_ot_up = 0;
@@ -138,6 +185,9 @@ static int ot_ensure_up(void)
         OSStatus err;
         OT_PROBE("InitOpenTransport", err = InitOpenTransport());
         if (err != kOTNoError) return 0;
+#if CQ_TX_ASYNC_CONNECT
+        if (!g_conn_upp) g_conn_upp = NewOTNotifyUPP(conn_notifier);
+#endif
         g_ot_up = 1;
     }
     return 1;
@@ -265,7 +315,25 @@ static void open_and_connect(cq_transport *t)
     sndCall.addr.buf = (UInt8 *)&sndAddr;
     sndCall.addr.len = sizeof(sndAddr);
 
+#if CQ_TX_ASYNC_CONNECT
+    /* Arm the notifier and flip async BEFORE the connect, so OTConnect returns
+     * at once instead of stalling the loop. If the notifier won't install, fall
+     * back to the synchronous issue below (t->async stays 0). */
+    t->conn_event = 0;
+    if (g_conn_upp && OTInstallNotifier(t->ep, g_conn_upp, t) == kOTNoError) {
+        OTSetAsynchronous(t->ep);
+        t->async = 1;
+    }
+#endif
     OT_PROBE("OTConnect", err = OTConnect(t->ep, &sndCall, NULL));
+    if (t->async) {
+        /* async: both kOTNoError and kOTNoDataErr mean "accepted, in progress";
+         * T_CONNECT/T_DISCONNECT lands later (pump_connect), bounded by the 2 s
+         * connect deadline. */
+        if (err == kOTNoError || err == kOTNoDataErr) { t->st = ST_CONNECTING; return; }
+        fail(t, CQ_TX_ERR_CONNECT, "Could not connect to");
+        return;
+    }
     if (err == kOTNoError) { t->st = ST_SENDING; return; }        /* immediate */
     if (err == kOTNoDataErr) { t->st = ST_CONNECTING; return; }   /* in progress */
     fail(t, CQ_TX_ERR_CONNECT, "Could not connect to");
@@ -274,9 +342,20 @@ static void open_and_connect(cq_transport *t)
 static void pump_connect(cq_transport *t)
 {
     OTResult look = OTLook(t->ep);
+#if CQ_TX_ASYNC_CONNECT
+    /* In async mode the notifier may have recorded the completion before OTLook
+     * surfaces it — honor whichever fired first. */
+    if (look != T_CONNECT && look != T_DISCONNECT && t->conn_event)
+        look = (OTResult)t->conn_event;
+#endif
     if (look == T_CONNECT) {
-        if (OTRcvConnect(t->ep, NULL) == kOTNoError) t->st = ST_SENDING;
-        else fail(t, CQ_TX_ERR_CONNECT, "Could not connect to");
+        if (OTRcvConnect(t->ep, NULL) == kOTNoError) {
+#if CQ_TX_ASYNC_CONNECT
+            /* connected: back to synchronous for the proven send/recv path */
+            if (t->async) { OTSetSynchronous(t->ep); t->async = 0; }
+#endif
+            t->st = ST_SENDING;
+        } else fail(t, CQ_TX_ERR_CONNECT, "Could not connect to");
     } else if (look == T_DISCONNECT) {
         OTRcvDisconnect(t->ep, NULL);
         fail(t, CQ_TX_ERR_CONNECT, "Connection refused by");
