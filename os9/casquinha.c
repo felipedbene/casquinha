@@ -77,7 +77,7 @@ enum {
     kQuitItem    = 3     /* Preferences, -, Quit */
 };
 
-#define CQ_BUILD_TAG "b59"  /* bump on every VM-iteration build (see status row,
+#define CQ_BUILD_TAG "b60"  /* bump on every VM-iteration build (see status row,
                              * the share filenames, and the per-build log name) */
 #define CQ_DEFAULT_HOST "10.0.100.112"  /* server address is a pref (Fio 6) */
 #define CQ_DEFAULT_PORT 70
@@ -242,6 +242,15 @@ static void DbgLog(const char *fmt, ...)
     FlushVol(NULL, 0);        /* commit now — the tail must survive a freeze */
     buf[n - 1] = '\n';        /* unix ending for the live tail */
     cq_tx_udp(gLogHost, gLogPort, buf, (size_t)n);
+}
+
+/* Freeze-probe sink (b60): the transport hands us a preformatted line when one
+ * of its un-deadlined synchronous OT provider traps runs slow — route it to the
+ * timestamped, FlushVol'd log so a stall lands on disk (and the UDP tail) with
+ * its trap name and elapsed ticks. */
+static void TxProbeLog(const char *msg)
+{
+    DbgLog("%s", msg);
 }
 
 /* --- transport controls (Fio 4) --- */
@@ -2741,6 +2750,7 @@ int main(void)
         DbgLog("boot %s  QT=%s ver=%08lx  MP=%s", CQ_BUILD_TAG,
                gQTOk ? "ok" : "MISSING", qtv, gMPOk ? "yes" : "no");
     }
+    cq_tx_set_log(TxProbeLog);   /* arm the b60 OT-trap freeze probe */
 
     {   /* converters: UTF-8 -> MacRoman (draw) and MacRoman -> UTF-8 (wire) */
         TextEncoding utf8 = CreateTextEncoding(kTextEncodingUnicodeV2_0,

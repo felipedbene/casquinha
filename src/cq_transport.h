@@ -104,6 +104,21 @@ void cq_tx_udp(const char *host, int port, const void *data, size_t len);
  * error code — so the FILE log can report whether the network mirror works. */
 void cq_tx_udp_stats(long *ok, long *fail, long *lastErr);
 
+/*
+ * Freeze probe (b60, design/FREEZE-AUDIT-b59.md §4/§9.1). The OT impl runs a
+ * handful of synchronous provider traps (OTOpenEndpoint / OTBind / OTConnect /
+ * OTUnbind / OTCloseProvider / InitOpenTransport) to completion on the
+ * cooperative loop, governed by NO TickCount deadline: if one stalls under a
+ * server-rollout connect storm the whole loop wedges. When a sink is installed
+ * the impl times each trap and reports any span past its warn threshold through
+ * this callback (one preformatted line, no trailing newline) — the app points
+ * it at DbgLog. Silent by default (NULL) and near-silent in healthy LAN
+ * operation. The POSIX impl accepts the sink and never fires (it completes on
+ * the first poll with no such traps).
+ */
+typedef void (*cq_tx_logfn)(const char *msg);
+void cq_tx_set_log(cq_tx_logfn fn);
+
 void cq_tx_free(cq_transport *t);
 
 #endif /* CQ_TRANSPORT_H */

@@ -310,6 +310,12 @@ void cq_tx_udp_stats(long *ok, long *fail, long *lastErr)
     if (lastErr) *lastErr = g_udp_lasterr;
 }
 
+/* Freeze probe sink (b60): accepted for contract parity. The POSIX impl
+ * completes a transaction on the first poll with none of the OT provider
+ * traps, so it never has a span to report — the sink is stored but unused. */
+static cq_tx_logfn g_log = NULL;
+void cq_tx_set_log(cq_tx_logfn fn) { g_log = fn; (void)g_log; }
+
 void cq_tx_udp(const char *host, int port, const void *data, size_t len)
 {
     static int ufd = -2;                 /* -2 untried, -1 dead, else the socket */

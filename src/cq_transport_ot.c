@@ -35,6 +35,68 @@
 #define DEADLINE_TICKS    (CQ_TX_DEADLINE_SECS * TICKS_PER_SEC)   /* 120 */
 #define WATCHDOG_TICKS    (CQ_TX_WATCHDOG_SECS * TICKS_PER_SEC)   /* 300 */
 
+/* --- b60 freeze probe (design/FREEZE-AUDIT-b59.md §4/§9.1) -------------------
+ * Bracket the un-deadlined synchronous provider traps with TickCount and report
+ * any span past the warn threshold through the app's log sink. A healthy LAN
+ * open/bind/connect/close is sub-tick, so this is silent in normal operation
+ * and fires loudly — with the trap's name and the elapsed ticks — exactly when
+ * one of them wedges the cooperative loop (the ~120 s = ~7200-tick event this
+ * build exists to catch). CQ_TX_PROBE_TRACE additionally emits a breadcrumb
+ * BEFORE each trap; DbgLog FlushVols every line, so that breadcrumb survives
+ * even a trap that never returns (belt-and-suspenders — the observed freeze did
+ * return, so the elapsed line alone localizes it). */
+#ifndef CQ_TX_PROBE
+#define CQ_TX_PROBE 1
+#endif
+#ifndef CQ_TX_PROBE_TRACE
+#define CQ_TX_PROBE_TRACE 0
+#endif
+#define CQ_TX_PROBE_WARN_TICKS 6   /* ~100 ms; anything slower on a LAN is suspect */
+
+static cq_tx_logfn g_log = NULL;
+
+void cq_tx_set_log(cq_tx_logfn fn) { g_log = fn; }
+
+#if CQ_TX_PROBE
+static void probe_emit(const char *name, unsigned long elapsed)
+{
+    if (g_log && elapsed >= (unsigned long)CQ_TX_PROBE_WARN_TICKS) {
+        char b[96];
+        snprintf(b, sizeof(b), "ot-probe: %s +%lut (%lums)",
+                 name, elapsed, elapsed * 1000UL / TICKS_PER_SEC);
+        g_log(b);
+    }
+}
+#if CQ_TX_PROBE_TRACE
+static void probe_trace(const char *name)
+{
+    if (g_log) { char b[64]; snprintf(b, sizeof(b), "ot-probe: > %s", name); g_log(b); }
+}
+#else
+#define probe_trace(name) ((void)0)
+#endif
+/* Time one synchronous provider call. `stmt` is the call (it may assign a
+ * result); the elapsed TickCount span is reported if it exceeds the threshold. */
+#define OT_PROBE(name, stmt) do {                                   \
+        unsigned long _p0;                                         \
+        probe_trace(name);                                         \
+        _p0 = (unsigned long)TickCount();                          \
+        stmt;                                                      \
+        probe_emit(name, (unsigned long)TickCount() - _p0);        \
+    } while (0)
+#else
+#define OT_PROBE(name, stmt) do { stmt; } while (0)
+#endif
+
+/* Endpoint teardown, probed: OTUnbind + OTCloseProvider are synchronous
+ * provider calls no deadline governs, run on every transaction close/fail/
+ * cancel/free — so every teardown site routes through here (§4). */
+static void ot_teardown(EndpointRef ep)
+{
+    OT_PROBE("OTUnbind", OTUnbind(ep));
+    OT_PROBE("OTCloseProvider", OTCloseProvider(ep));
+}
+
 typedef enum {
     ST_INIT = 0,      /* open + bind the endpoint, resolve, issue connect */
     ST_CONNECTING,    /* waiting for T_CONNECT */
@@ -73,7 +135,9 @@ static int g_ot_up = 0;
 static int ot_ensure_up(void)
 {
     if (!g_ot_up) {
-        if (InitOpenTransport() != kOTNoError) return 0;
+        OSStatus err;
+        OT_PROBE("InitOpenTransport", err = InitOpenTransport());
+        if (err != kOTNoError) return 0;
         g_ot_up = 1;
     }
     return 1;
@@ -110,8 +174,7 @@ static cq_tx_status fail(cq_transport *t, cq_tx_error e, const char *what)
     snprintf(t->message, sizeof(t->message), "%s %s:%d.", what, t->host, t->port);
     if (t->ep != kOTInvalidEndpointRef) {
         OTSndOrderlyDisconnect(t->ep);   /* best-effort */
-        OTUnbind(t->ep);
-        OTCloseProvider(t->ep);
+        ot_teardown(t->ep);
         t->ep = kOTInvalidEndpointRef;
     }
     return t->status;
@@ -181,7 +244,8 @@ static void open_and_connect(cq_transport *t)
 
     if (!ot_ensure_up()) { fail(t, CQ_TX_ERR_CONNECT, "Open Transport unavailable for"); return; }
 
-    t->ep = OTOpenEndpoint(OTCreateConfiguration(kTCPName), 0, NULL, &err);
+    OT_PROBE("OTOpenEndpoint",
+             t->ep = OTOpenEndpoint(OTCreateConfiguration(kTCPName), 0, NULL, &err));
     if (err != kOTNoError || t->ep == kOTInvalidEndpointRef) {
         t->ep = kOTInvalidEndpointRef;
         fail(t, CQ_TX_ERR_CONNECT, "Could not open a TCP endpoint to");
@@ -191,7 +255,7 @@ static void open_and_connect(cq_transport *t)
     OTSetNonBlocking(t->ep);
     OTUseSyncIdleEvents(t->ep, false);
 
-    err = OTBind(t->ep, NULL, NULL);       /* dynamic local address */
+    OT_PROBE("OTBind", err = OTBind(t->ep, NULL, NULL));   /* dynamic local address */
     if (err != kOTNoError) { fail(t, CQ_TX_ERR_CONNECT, "Could not bind a socket to"); return; }
 
     if (!resolve_host(t->host, &ip)) { fail(t, CQ_TX_ERR_CONNECT, "Could not resolve"); return; }
@@ -201,7 +265,7 @@ static void open_and_connect(cq_transport *t)
     sndCall.addr.buf = (UInt8 *)&sndAddr;
     sndCall.addr.len = sizeof(sndAddr);
 
-    err = OTConnect(t->ep, &sndCall, NULL);
+    OT_PROBE("OTConnect", err = OTConnect(t->ep, &sndCall, NULL));
     if (err == kOTNoError) { t->st = ST_SENDING; return; }        /* immediate */
     if (err == kOTNoDataErr) { t->st = ST_CONNECTING; return; }   /* in progress */
     fail(t, CQ_TX_ERR_CONNECT, "Could not connect to");
@@ -266,8 +330,7 @@ static void pump_recv(cq_transport *t)
                  * FIN_WAIT for our FIN, logs a reset on EVERY successful
                  * transaction (Fio B). */
                 OTSndOrderlyDisconnect(t->ep);
-                OTUnbind(t->ep);
-                OTCloseProvider(t->ep);
+                ot_teardown(t->ep);
                 t->ep = kOTInvalidEndpointRef;
                 t->status = CQ_TX_DONE;
                 t->st = ST_DONE;
@@ -276,7 +339,7 @@ static void pump_recv(cq_transport *t)
             if (look == T_DISCONNECT) {
                 OTRcvDisconnect(t->ep, NULL);
                 if (t->len > 0) {                /* got bytes then reset: keep them */
-                    OTUnbind(t->ep); OTCloseProvider(t->ep); t->ep = kOTInvalidEndpointRef;
+                    ot_teardown(t->ep); t->ep = kOTInvalidEndpointRef;
                     t->status = CQ_TX_DONE; t->st = ST_DONE;
                 } else {
                     fail(t, CQ_TX_ERR_STREAM, "Read failed from");
@@ -289,7 +352,7 @@ static void pump_recv(cq_transport *t)
          * (best-effort orderly release first — connection state is unknown) */
         if (t->len > 0) {
             OTSndOrderlyDisconnect(t->ep);
-            OTUnbind(t->ep); OTCloseProvider(t->ep); t->ep = kOTInvalidEndpointRef;
+            ot_teardown(t->ep); t->ep = kOTInvalidEndpointRef;
             t->status = CQ_TX_DONE; t->st = ST_DONE;
         } else {
             fail(t, CQ_TX_ERR_STREAM, "Read failed from");
@@ -369,8 +432,7 @@ void cq_tx_cancel(cq_transport *t)
     t->cancelled = 1;
     if (t->ep != kOTInvalidEndpointRef) {
         OTSndOrderlyDisconnect(t->ep);   /* we stop listening; a sent selector still ran */
-        OTUnbind(t->ep);
-        OTCloseProvider(t->ep);
+        ot_teardown(t->ep);
         t->ep = kOTInvalidEndpointRef;
     }
 }
@@ -379,8 +441,7 @@ void cq_tx_free(cq_transport *t)
 {
     if (!t) return;
     if (t->ep != kOTInvalidEndpointRef) {
-        OTUnbind(t->ep);
-        OTCloseProvider(t->ep);
+        ot_teardown(t->ep);
     }
     free(t->host);
     free(t->selector);
