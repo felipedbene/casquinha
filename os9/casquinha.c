@@ -253,6 +253,53 @@ static void TxProbeLog(const char *msg)
     DbgLog("%s", msg);
 }
 
+/* --- Loop-limb watchdog (RESILIENCE-ROADMAP O1) ----------------------------
+ * Same shape as the transport's OT_PROBE (b60): bracket each WORK limb of the
+ * cooperative loop with TickCount and, when a single pass through a limb blows
+ * the budget, name it in the log — silent while healthy. This turns an unknown
+ * "the app froze" into one line saying WHICH limb (HandleEvent / PollNetwork /
+ * PumpAux / TickCaret / TickView) ate the loop, so the next stall arrives
+ * pre-localized instead of as a mystery.
+ * NB: WaitNextEvent is deliberately NOT bracketed — it legitimately sleeps up
+ * to ComputeSleep() (≤60 ticks = 1 s) waiting for events; that is expected
+ * idle, not a stall. Only the work limbs are measured (HandleEvent runs solely
+ * when WNE returned an event). -DCQ_LOOP_PROBE=0 compiles it out to the bare
+ * statements, leaving the loop byte-for-byte as it was. */
+#ifndef CQ_LOOP_PROBE
+#define CQ_LOOP_PROBE 1
+#endif
+#if CQ_LOOP_PROBE
+#define CQ_LOOP_PROBE_WARN_TICKS 24   /* ~0.4 s at 60 ticks/s */
+#define LOOP_PROBE(name, stmt) do {                                   \
+        unsigned long _lp0 = (unsigned long)TickCount();              \
+        stmt;                                                         \
+        { unsigned long _lpd = (unsigned long)TickCount() - _lp0;     \
+          if (_lpd >= (unsigned long)CQ_LOOP_PROBE_WARN_TICKS)        \
+              DbgLog("loop-probe: %s +%lut (%lums)", (name), _lpd,    \
+                     _lpd * 1000UL / 60UL); }                         \
+    } while (0)
+#else
+#define LOOP_PROBE(name, stmt) do { stmt; } while (0)
+#endif
+
+/* --- Online/offline edge logging (RESILIENCE-ROADMAP O2) -------------------
+ * Connect failures were invisible in the log (a 90 s backend blackout produced
+ * zero failure lines). The poll path flips gOnline — true in AdoptReply, false
+ * in PumpTx's CQ_TX_FAILED branch — so we watch that flag once per loop and log
+ * only the TRANSITION: offline carries the transport's last error (gLastMsg),
+ * online is a bare recovery marker. Edge-triggered by design (prev held in a
+ * static) — never per-failure, so backoff retries don't spam the log. Boot
+ * state is offline, matching gOnline's initial false, so no spurious line. */
+static void NetEdge(void)
+{
+    static int prev = 0;          /* 0 = offline (matches gOnline's boot state) */
+    int now = gOnline ? 1 : 0;
+    if (now == prev) return;
+    prev = now;
+    if (now) DbgLog("net: online");
+    else     DbgLog("net: offline (%s)", gLastMsg[0] ? gLastMsg : "no reply");
+}
+
 /* --- transport controls (Fio 4) --- */
 static ControlHandle gPrev = NULL, gPlay = NULL, gNext = NULL, gVol = NULL;
 static cq_debounce   gDeb;               /* pre-wire coalescer for prev/next (law 1) */
@@ -2805,12 +2852,15 @@ int main(void)
     }
 
     while (gRunning) {
+        /* WaitNextEvent is intentionally OUTSIDE the probe — it sleeps for
+         * events (O1). Each WORK limb is bracketed; NetEdge logs net edges (O2). */
         if (WaitNextEvent(everyEvent, &ev, ComputeSleep(), NULL))
-            HandleEvent(&ev);
-        PollNetwork();       /* /now poll + command/cover/debounce pumps */
-        PumpAux();           /* fire/pls/search/queue/stream pumps + ServiceAudio */
-        TickCaret();         /* blink the search caret (port-pinned) */
-        TickView();          /* render → diff → repaint on change (≤2 Hz) */
+            LOOP_PROBE("HandleEvent", HandleEvent(&ev));
+        LOOP_PROBE("PollNetwork", PollNetwork());   /* /now poll + command/cover/debounce pumps */
+        LOOP_PROBE("PumpAux",     PumpAux());        /* fire/pls/search/queue/stream pumps + ServiceAudio */
+        NetEdge();                                   /* O2: log online↔offline transitions (edge only) */
+        LOOP_PROBE("TickCaret",   TickCaret());      /* blink the search caret (port-pinned) */
+        LOOP_PROBE("TickView",    TickView());       /* render → diff → repaint on change (≤2 Hz) */
     }
 
     StopAudio("quit");       /* parks the decode task before cursor resets */
