@@ -2459,6 +2459,42 @@ static void SavePrefs(void)
     FSClose(ref);
 }
 
+/* O3 (RESILIENCE-ROADMAP Phase 2): the Prefs ModalDialog runs a nested modal
+ * loop that starves WaitNextEvent — the same freeze class the loop documents at
+ * :1623 (menus, drags and dialogs). Decode survives off-loop (b52), but the
+ * on-main network polls and the audio channel-start/latency-trim stall while
+ * Prefs is open. A ModalFilterUPP lets us drive the same per-pass background
+ * work on every modal pass, so the loop keeps breathing behind the dialog.
+ * Set CQ_PREFS_PUMP=0 to fall back to the proven-b60 ModalDialog(NULL, ...). */
+#ifndef CQ_PREFS_PUMP
+#define CQ_PREFS_PUMP 1
+#endif
+
+#if CQ_PREFS_PUMP
+/* The same three limbs the main loop runs (minus WNE/caret), driven per modal
+ * pass. Throttled to ~once every few ticks because ModalDialog calls the filter
+ * very frequently (null/mouse-moved events). Reentrancy: DoPrefs is reached
+ * from the loop (mouseDown → DoMenu → DoPrefs), so this is a reentrant poll
+ * slice — safe because PollNetwork/PumpAux are idempotent bounded slices; we
+ * deliberately call NOTHING that could open a nested dialog. Returns false so
+ * ModalDialog keeps its normal button/keyboard processing. */
+static pascal Boolean PrefsFilter(DialogPtr d, EventRecord *ev, short *item)
+{
+    static unsigned long lastPump = 0;
+    unsigned long now = (unsigned long)TickCount();
+    (void)d; (void)ev; (void)item;
+    if (now - lastPump >= 4) {          /* ~once per 4 ticks, not every null event */
+        lastPump = now;
+        PollNetwork();                  /* /now poll + command/cover/debounce pumps */
+        PumpAux();                      /* fire/pls/search/queue/stream + ServiceAudio */
+        TickView();                     /* render → diff → repaint on change */
+    }
+    return false;                       /* not handled — ModalDialog does its own work */
+}
+
+static ModalFilterUPP gPrefsFilterUPP = NULL;   /* built once, lives for the run */
+#endif
+
 /* Preferences dialog: edit host + port, save, and reconnect. */
 static void DoPrefs(void)
 {
@@ -2484,7 +2520,13 @@ static void DoPrefs(void)
     C2P(pbuf, ps); SetDialogItemText(h, ps);
     SelectDialogItemText(d, 3, 0, 32767);
 
-    do { ModalDialog(NULL, &item); } while (item != 1 && item != 2);
+#if CQ_PREFS_PUMP
+    if (!gPrefsFilterUPP) gPrefsFilterUPP = NewModalFilterUPP(PrefsFilter);
+    /* Filter services the loop each pass so polls/audio don't freeze (O3). */
+    do { ModalDialog(gPrefsFilterUPP, &item); } while (item != 1 && item != 2);
+#else
+    do { ModalDialog(NULL, &item); } while (item != 1 && item != 2);   /* proven b60 */
+#endif
 
     if (item == 1) {                                   /* Save */
         char host[64]; int p;
