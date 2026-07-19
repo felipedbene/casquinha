@@ -4,8 +4,7 @@
 
 <img src="design/icon/casquinha-icon.png" alt="Casquinha icon" width="96">
 
-> 📸 _Screenshot coming soon — Casquinha running on a real Power Mac (System 9)._
-<!-- When you capture one, replace the line above with: ![Casquinha on Mac OS 9](design/screenshot.png) -->
+![Casquinha running on Mac OS 9.2 — now playing over gopher-spot, with search and queue](design/screenshot.png)
 
 A native **Mac OS 9.2** Spotify remote — *the essential Radinho, on the oldest
 machine yet* — speaking the frozen
