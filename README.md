@@ -1,5 +1,12 @@
 # Casquinha
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) ![Platform](https://img.shields.io/badge/Mac%20OS-9-black.svg) ![Arch](https://img.shields.io/badge/PowerPC-C99-555.svg)
+
+<img src="design/icon/casquinha-icon.png" alt="Casquinha icon" width="96">
+
+> 📸 _Screenshot coming soon — Casquinha running on a real Power Mac (System 9)._
+<!-- When you capture one, replace the line above with: ![Casquinha on Mac OS 9](design/screenshot.png) -->
+
 A native **Mac OS 9.2** Spotify remote — *the essential Radinho, on the oldest
 machine yet* — speaking the frozen
 **[gopher-spot](https://github.com/felipedbene/gopher-spot) machine API
@@ -186,3 +193,10 @@ design/
 
 Prefix **CQ** / `cq_`. The name is *casquinha* — an ice-cream cone; the humblest
 scoop in the freezer, for the oldest Mac in the house.
+
+---
+### Part of the gopher constellation
+**Servers & tools:** [gopher-core](https://github.com/felipedbene/gopher-core) · [gopher-cta](https://github.com/felipedbene/gopher-cta) · [gopher-blog](https://github.com/felipedbene/gopher-blog) · [gopher-askthedeck](https://github.com/felipedbene/gopher-askthedeck) · [gopher-spot](https://github.com/felipedbene/gopher-spot) · [the-economist-epub](https://github.com/felipedbene/the-economist-epub)
+**Clients:** [casquinha](https://github.com/felipedbene/casquinha) (Mac OS 9) · [detoca](https://github.com/felipedbene/detoca) (OS X 10.6) · [degelato](https://github.com/felipedbene/degelato) (OS X 10.5 PPC) · [deburrow](https://github.com/felipedbene/deburrow) (Android)
+**Protocol notes:** [fhb](https://github.com/felipedbene/fhb)
+---
