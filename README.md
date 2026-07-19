@@ -44,7 +44,9 @@ state entirely in the Toolbox:
   and prev behave natively. Nothing playback-related lives in a menu: on a
   cooperative OS, menu tracking freezes the app — and the audio with it.
 - **Cover art** — QuickTime GraphicsImporter, behind a fail-once cover cache.
-- **Preferences** (⌘,) — the server address, saved to disk.
+- **Preferences** (⌘,) — File▸Preferences opens a hand-editable config file
+  (server `host:port`) in SimpleText; edit it, save, and switch back to
+  Casquinha to apply on resume (no modal dialog). Saved to disk.
 - **Audio** (automatic; ⌘T toggles manually) — with a live, player-aware
   status readout in radio vocabulary: `tuning in… → buffering… N% → on air`,
   `playing out… / standing by` when upstream pauses, `waiting for Spotify…`
@@ -68,12 +70,12 @@ after a change. See [`design/AUDIT-backend-exhaustion.md`](design/AUDIT-backend-
 ## Status
 
 The pure core (Codec / Model / Reconciler) is plain C99 with an offline suite
-that runs **on a modern Mac** — no Retro68, no emulator (`make test`, **203
+that runs **on a modern Mac** — no Retro68, no emulator (`make test`, **311
 checks green**, including decoding a captured slice of the real stream). The
 app is classic PowerPC + Open Transport + the Toolbox, cross-built with
 Retro68 and run in **UTM** (QEMU/PPC).
 
-Exercised on the VM (through b49; binaries on the
+Exercised on the VM (through b63; binaries on the
 [releases page](https://github.com/felipedbene/casquinha/releases)):
 auto-start, Now Playing, transport, search, queue (add + jump with **native
 play-from contexts** via gopher-spot's `/spot/api/1/play/from`, spec'd from
@@ -97,13 +99,13 @@ present:
   log per build, flushed per line so it survives a freeze), and
 - each line is **mirrored live as a UDP datagram**. Two sinks exist: the
   cluster's always-on **log-sink** (a MetalLB service at
-  `10.0.100.114:5514`, deployed with gopher-spot; read it with
+  `<log-sink-host>:5514`, deployed with gopher-spot; read it with
   `kubectl -n gopher-spot logs -f deploy/log-sink` — lines are prefixed
   with the sender IP so all family clients can share it), or an ad-hoc
   `make logtail` on the dev Mac (a tiny Python listener; macOS `nc -kul`
   latches onto the first sender and drops the rest). The marker file's
   first line selects the target as `host:port` — put
-  `10.0.100.114:5514` in it for the cluster sink.
+  `<log-sink-host>:5514` in it for the cluster sink.
 
 Delete the marker and the app goes quiet again. Extras in `tools/`:
 `mp3scan.c` (mount forensics: frame gaps/format flips in a captured stream),
@@ -129,12 +131,12 @@ Reconciler layers compile and run against the copied fixtures with the system
 The Mac OS 9 app itself cross-builds with the **Retro68** GCC toolchain
 (PowerPC/CFM + the Rez resource compiler + Universal Interfaces) and runs in
 **UTM** (QEMU/PPC) with shared networking, so the OS 9 guest reaches the
-gopher-spot server at `10.0.100.112:70` outbound through the host. That target is
+gopher-spot server at `<spot-host>:70` outbound through the host. That target is
 wired up from Fio 3 on (`make app`, once `RETRO68=<toolchain>` is set).
 
 ## Network contract (v1, frozen)
 
-- Server `10.0.100.112:70` (LAN only, plain TCP, no TLS). Write `selector\r\n`,
+- Server `<spot-host>:70` (LAN only, plain TCP, no TLS). Write `selector\r\n`,
   read to EOF. `/now` returns UTF-8 `key<TAB>value` lines.
 - **Ignore unknown keys, tolerate missing ones, key off `state` first** — the API
   is additive; surface growth must never hard-fail the client.
@@ -143,7 +145,7 @@ wired up from Fio 3 on (`make app`, once `RETRO68=<toolchain>` is set).
 Capture a fresh fixture from the live server:
 
 ```sh
-printf '/spot/api/1/now\r\n' | nc 10.0.100.112 70 > tests/Fixtures/now_live.txt
+printf '/spot/api/1/now\r\n' | nc <spot-host> 70 > tests/Fixtures/now_live.txt
 ```
 
 ## Layout

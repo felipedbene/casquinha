@@ -79,7 +79,7 @@ enum {
 
 #define CQ_BUILD_TAG "b63"  /* bump on every VM-iteration build (see status row,
                              * the share filenames, and the per-build log name) */
-#define CQ_DEFAULT_HOST "10.0.100.112"  /* server address is a pref (Fio 6) */
+#define CQ_DEFAULT_HOST "192.0.2.10"  /* placeholder; server address is a pref (Fio 6) */
 #define CQ_DEFAULT_PORT 70
 #define CQ_POLL_TICKS 120           /* 2 s at 60 ticks/sec (law 5: >= micro-cache) */
 #define CQ_POLL_CAP   1800          /* back off to at most 30 s on errors (429) */
@@ -165,7 +165,7 @@ static cq_backoff    gFBackoff;          /* lazy cadence, backs off on errors */
  * NO MARKER = NO TELEMETRY: no log file, no datagrams — a clean build for
  * anyone else's Mac. Best-effort everywhere: a logger must never get in
  * the way. */
-#define CQ_LOG_HOST "10.0.1.165"   /* default mirror target (dev Mac) */
+#define CQ_LOG_HOST "192.0.2.20"   /* placeholder mirror target; set via the Debug marker's first line */
 #define CQ_LOG_PORT 5514
 static short gLogRef  = 0;   /* 0 = not open yet */
 static int   gLogMode = 0;   /* 0 = marker unchecked, -1 = off, 1 = on */

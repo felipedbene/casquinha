@@ -64,8 +64,8 @@ build/run_tests: $(CORE_SRC) $(NET_SRC) $(TEST_SRC)
 	$(CC) $(CFLAGS) $(CORE_SRC) $(NET_SRC) $(TEST_SRC) -o $@
 
 # End-to-end check against the REAL server (host-side portkit). Override on the
-# command line: make probe HOST=10.0.100.112 PORT=70
-HOST ?= 10.0.100.112
+# command line: make probe HOST=192.0.2.10 PORT=70
+HOST ?= 192.0.2.10
 PORT ?= 70
 probe: build/probe
 	build/probe $(HOST) $(PORT)

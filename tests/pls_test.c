@@ -18,8 +18,8 @@ void pls_tests(void)
 
     /* basic PLS */
     { char *u = cq_pls_first_url(
-        "[playlist]\nNumberOfEntries=1\nFile1=http://10.0.100.113:8000/spotify.mp3\nVersion=2\n");
-      CHECK_STR(u, "http://10.0.100.113:8000/spotify.mp3", "PLS File1 extracted");
+        "[playlist]\nNumberOfEntries=1\nFile1=http://192.0.2.30:8000/spotify.mp3\nVersion=2\n");
+      CHECK_STR(u, "http://192.0.2.30:8000/spotify.mp3", "PLS File1 extracted");
       free(u); }
 
     /* lowest File index wins regardless of order */

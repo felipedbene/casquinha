@@ -3,7 +3,7 @@
  * against the REAL gopher-spot server (the closest thing to portkit for the C
  * port). Fetches /spot/api/1/now and prints the parsed snapshot.
  *
- *   make probe                 # 10.0.100.112:70
+ *   make probe                 # 192.0.2.10:70
  *   build/probe <host> <port> [selector]
  *
  * This is the same seam the OS 9 app will drive; here it runs on the host with
@@ -21,7 +21,7 @@
 
 int main(int argc, char **argv)
 {
-    const char *host = argc > 1 ? argv[1] : "10.0.100.112";
+    const char *host = argc > 1 ? argv[1] : "192.0.2.10";
     int         port = argc > 2 ? atoi(argv[2]) : 70;
     const char *sel  = argc > 3 ? argv[3] : "/spot/api/1/now";
     cq_transport *t;
